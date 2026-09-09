@@ -104,3 +104,64 @@ mapping:
 # message.
 range_boundary_supported_types: [DATE, INTEGER]
 ```
+
+### PG mode
+```yaml
+mapping:
+  SMALLINT: INTEGER
+  INTEGER: INTEGER
+  INT: INTEGER
+  BIGINT: BIGINT
+  DECIMAL: "NUMERIC({length},{scale})"
+  DEC: "NUMERIC({length},{scale})"
+  NUMERIC: "NUMERIC({length},{scale})"
+
+  DECFLOAT: TEXT
+  DECFLOAT16: TEXT
+  DECFLOAT34: TEXT
+
+  REAL: "DOUBLE PRECISION"
+  FLOAT: "DOUBLE PRECISION"
+  DOUBLE: "DOUBLE PRECISION"
+
+  CHARACTER: "CHAR({length})"
+  CHAR: "CHAR({length})"
+  VARCHAR: "VARCHAR({length})"
+  GRAPHIC: "CHAR({length})"
+  VARGRAPHIC: "VARCHAR({length})"
+  VARG: "VARCHAR({length})"
+
+  "LONG VARCHAR": TEXT
+  "LONG VARG": TEXT
+  "LONG VARGRAPHIC": TEXT
+  CLOB: TEXT
+  DBCLOB: TEXT
+  BLOB: BYTEA
+
+  DATE: DATE
+  TIME: TIME
+  TIMESTAMP: TIMESTAMP
+  TIMESTMP: TIMESTAMP
+
+  BINARY: BYTEA
+  VARBINARY: BYTEA
+  VARBIN: BYTEA
+
+  CHARACTER_FOR_BIT_DATA: BYTEA
+  CHAR_FOR_BIT_DATA: BYTEA
+  VARCHAR_FOR_BIT_DATA: BYTEA
+  GRAPHIC_FOR_BIT_DATA: BYTEA
+  VARGRAPHIC_FOR_BIT_DATA: BYTEA
+
+  ROWID: TEXT
+  DATALINK: TEXT
+  XML: XML
+  BOOLEAN: BOOLEAN
+
+  US_DOLLAR: "NUMERIC({length},{scale})"
+  MONEY: "NUMERIC({length},{scale})"
+  EMAIL_ADDR: "VARCHAR({length})"
+  EMAILADDR: "VARCHAR({length})"
+
+range_boundary_supported_types: [DATE, INTEGER]
+```
