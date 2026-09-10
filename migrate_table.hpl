@@ -96,6 +96,7 @@ private String statusDbPath;
 private boolean preflight;
 private String tgtConnName;
 private java.util.List identityColumns;
+private int nulBytesStrippedCount;
 
 // Rows are batched into this buffer and flushed to edbldr's stdin every
 // rowBatchSize rows, instead of one write() call per row - measured
@@ -133,6 +134,7 @@ public boolean processRow() throws HopException
     rowMetaRef = getInputRowMeta();
     rowBatch = new StringBuffer();
     rowBatchCount = 0;
+    nulBytesStrippedCount = 0;
     resumeFromCheckpoint = Boolean.parseBoolean(getVariable("RESUME_FROM_CHECKPOINT", "false"));
     statusDbPath = getVariable("STATUS_DB_PATH");
     preflight = Boolean.parseBoolean(getVariable("PREFLIGHT", "false"));
@@ -531,6 +533,9 @@ private boolean finishAndVerify() {
     } else {
       logBasic("edbldr loaded " + targetTable + " successfully. Output: " + output);
     }
+    if (nulBytesStrippedCount &gt; 0) {
+      logBasic("Stripped NUL byte(s) (0x00) from " + nulBytesStrippedCount + " cell(s) in " + targetTable + " before loading - Postgres/EPAS cannot store them in text columns; likely legacy padding/binary leftovers in a source CHAR/VARCHAR column not flagged as FOR BIT DATA.");
+    }
     resyncIdentitySequences();
     return true;
   }
@@ -609,6 +614,20 @@ private String formatRowAsCsv(org.apache.hop.core.row.IRowMeta rowMeta, Object[]
       } catch (Exception e) {
         cell = String.valueOf(v);
       }
+    }
+
+    // Postgres/EPAS can never store a NUL byte (0x00) in a text/char
+    // column - not an encoding nuance, a hard limitation - so passing
+    // one through always fails the load (as "invalid byte sequence for
+    // encoding UTF8: 0x00", sometimes also confusing edbldr's own CSV
+    // parser into reporting "unterminated CSV quoted field" for the
+    // same cell). Legacy DB2 for i CHAR fields not detected as FOR BIT
+    // DATA (see the CCSID check above) can carry stray NUL padding/old
+    // binary leftovers - stripping it here is always a safe
+    // improvement, since a NUL byte could never have loaded anyway.
+    if (cell != null &amp;&amp; cell.indexOf('\u0000') &gt;= 0) {
+      cell = cell.replace("\u0000", "");
+      nulBytesStrippedCount++;
     }
 
     boolean isRealValue = (v != null);
@@ -736,6 +755,29 @@ private boolean isYes(Object flagObj) {
 
 private String sqlLiteral(String s) {
   return "'" + s.replace("'", "''") + "'";
+}
+
+// CCSIDs confirmed single-byte-per-character (one storage byte always
+// equals exactly one character, so DB2's byte-based LENGTH is safe to
+// use directly as a Postgres CHAR(n)/VARCHAR(n) character cap):
+//   37    - EBCDIC US/Canada
+//   500   - EBCDIC International (Latin-1-based)
+//   1025  - EBCDIC Cyrillic
+//   28709 - EBCDIC Traditional Chinese SBCS (the single-byte companion
+//     CCSID for mixed CCSID 937 - confirmed seen on a real system
+//     across DATE/TIME/TIMESTAMP/CLOB columns too, not just CHAR/
+//     VARCHAR, which only happens for a library/table-level *default*
+//     CCSID, not one deliberately chosen per-column for DBCS content)
+// Deliberately NOT included (real, not just theoretical, on a system
+// this tool has actually migrated): 833/835/937/933 (mixed SBCS+DBCS
+// EBCDIC - e.g. Korean 933, Traditional Chinese 937 - pack characters
+// using shift codes, so byte count != character count), 1200/1208
+// (UTF-16BE/UTF-8, genuinely variable-width), 13488 (UCS-2, 2
+// bytes/char). Extend this list only for a CCSID actually verified
+// single-byte - see lookupType's _MIXED_CCSID handling above for what
+// happens to everything else.
+private boolean isKnownSingleByteCcsid(String ccsidStr) {
+  return "37".equals(ccsidStr) || "500".equals(ccsidStr) || "1025".equals(ccsidStr) || "28709".equals(ccsidStr);
 }
 
 // Partition catalog query. PARTITION_TYPE is 'R' (range) or 'H' (hash).
@@ -936,6 +978,25 @@ public boolean processRow() throws HopException
                 || resolvedType.equals("VARCHAR") || resolvedType.equals("GRAPHIC") || resolvedType.equals("VARGRAPHIC");
               if (isBitData &amp;&amp; eligibleForBitData) {
                 lookupType = resolvedType + "_FOR_BIT_DATA";
+              } else if (eligibleForBitData &amp;&amp; ccsidStr.length() &gt; 0 &amp;&amp; !isKnownSingleByteCcsid(ccsidStr)) {
+                // DB2 for i's LENGTH is a byte count, which only equals
+                // the Postgres CHAR(n)/VARCHAR(n) *character* count for a
+                // true single-byte (SBCS) CCSID. A mixed SBCS+DBCS CCSID
+                // (e.g. Korean 933, Traditional Chinese 937) can pack
+                // more logical characters per byte via shift codes, or
+                // fewer (multi-byte Unicode CCSIDs like 1200/1208), so
+                // treating LENGTH as a character cap either overflows at
+                // load time ("value too long for type character(n)" on
+                // real, valid text - confirmed against a real CCSID 933
+                // column) or wastes space - never a hard failure the
+                // other way. Only a short, explicit allowlist of CCSIDs
+                // confirmed single-byte (see isKnownSingleByteCcsid) get
+                // the exact-length treatment; every other non-binary
+                // CCSID is mapped to unbounded TEXT instead, which is
+                // always safe (never rejects a value at load time) even
+                // if it's occasionally more permissive than strictly
+                // necessary.
+                lookupType = resolvedType + "_MIXED_CCSID";
               }
             }
 
@@ -967,7 +1028,6 @@ public boolean processRow() throws HopException
             if (!usedOverride) {
               boolean isIdentity = row.length &gt; 10 &amp;&amp; isYes(row[10]);
               boolean isNullable = row.length &lt;= 7 || row[7] == null || isYes(row[7]);
-              logBasic("DEBUG " + colName + " | row.length=" + row.length + " | row[7]=" + (row.length &gt; 7 ? String.valueOf(row[7]) : "N/A") + " | isNullable=" + isNullable);
               boolean hasDefault = row.length &gt; 8 &amp;&amp; isYes(row[8]);
               String columnDefault = row.length &gt; 9 &amp;&amp; row[9] != null ? String.valueOf(row[9]).trim() : null;
 
@@ -1008,7 +1068,6 @@ public boolean processRow() throws HopException
               }
             }
 
-            logBasic("DEBUG2 " + colName + " => [" + colDef.toString() + "]");
             columnDefs.add(colDef.toString());
             colTypeMap.put(colName, pgType);
 
@@ -1255,7 +1314,6 @@ public boolean processRow() throws HopException
             ddl.append(q(fullDef.substring(0, sp))).append(fullDef.substring(sp));
           }
           ddl.append(")");
-          logBasic("DEBUG3 CREATE TABLE for " + tableName + " => [" + ddl.toString() + "]");
           ddlStatements.add(ddl.toString());
         }
 
