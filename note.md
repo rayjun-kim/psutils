@@ -225,3 +225,46 @@ range_boundary_supported_types: [DATE, INTEGER]
 | BOOLEAN | BOOLEAN |
 | DISTINCT (UDT, 예: US_DOLLAR/MONEY) | NUMERIC({length},{scale}) |
 | DISTINCT (UDT, 예: EMAIL_ADDR) | VARCHAR({length}) |
+
+
+
+
+```sql
+CASE UPPER(TRIM(COALESCE(TYP.SOURCE_TYPE, C.DATA_TYPE))) " +
+                "WHEN 'VARCHAR' THEN CASE WHEN C.CCSID = 65535 THEN 'BYTEA' ELSE 'VARCHAR2(' || C.LENGTH || ')' END " +
+                "WHEN 'CHARACTER' THEN CASE WHEN C.CCSID = 65535 THEN 'BYTEA' ELSE 'CHAR(' || C.LENGTH || ')' END " +
+                "WHEN 'CHAR' THEN CASE WHEN C.CCSID = 65535 THEN 'BYTEA' ELSE 'CHAR(' || C.LENGTH || ')' END " +
+                "WHEN 'VARGRAPHIC' THEN 'NVARCHAR2(' || C.LENGTH || ')' " +
+                "WHEN 'VARG' THEN 'NVARCHAR2(' || C.LENGTH || ')' " +
+                "WHEN 'GRAPHIC' THEN 'NCHAR(' || C.LENGTH || ')' " +
+                "WHEN 'SMALLINT' THEN 'SMALLINT' " +
+                "WHEN 'INTEGER' THEN 'INTEGER' " +
+                "WHEN 'BIGINT' THEN 'BIGINT' " +
+                "WHEN 'DECIMAL' THEN 'NUMBER(' || C.LENGTH || ',' || COALESCE(C.NUMERIC_SCALE, 0) || ')' " +
+                "WHEN 'NUMERIC' THEN 'NUMBER(' || C.LENGTH || ',' || COALESCE(C.NUMERIC_SCALE, 0) || ')' " +
+                "WHEN 'DECFLOAT' THEN 'NUMBER' " +
+                "WHEN 'DECFLOAT16' THEN 'NUMBER' " +
+                "WHEN 'DECFLOAT34' THEN 'NUMBER' " +
+                "WHEN 'REAL' THEN 'FLOAT' " +
+                "WHEN 'FLOAT' THEN 'FLOAT' " +
+                "WHEN 'DOUBLE' THEN 'DOUBLE PRECISION' " +
+                "WHEN 'BOOLEAN' THEN 'BOOLEAN' " +
+                "WHEN 'DATE' THEN 'DATE' " +
+                "WHEN 'TIME' THEN 'TIME' " +
+                "WHEN 'TIMESTAMP' THEN 'TIMESTAMP' " +
+                "WHEN 'TIMESTMP' THEN 'TIMESTAMP' " +
+                "WHEN 'BINARY' THEN 'RAW(' || C.LENGTH || ')' " +
+                "WHEN 'VARBINARY' THEN 'RAW(' || C.LENGTH || ')' " +
+                "WHEN 'VARBIN' THEN 'RAW(' || C.LENGTH || ')' " +
+                "WHEN 'LONG VARCHAR' THEN 'CLOB' " +
+                "WHEN 'LONG VARG' THEN 'NCLOB' " +
+                "WHEN 'LONG VARGRAPHIC' THEN 'NCLOB' " +
+                "WHEN 'CLOB' THEN 'CLOB' " +
+                "WHEN 'BLOB' THEN 'BLOB' " +
+                "WHEN 'DBCLOB' THEN 'CLOB' " +
+                "WHEN 'XML' THEN 'XMLTYPE' " +
+                "WHEN 'ROWID' THEN 'VARCHAR2(100)' " +
+                "WHEN 'DATALINK' THEN 'VARCHAR2(255)' " +
+                "WHEN 'DISTINCT' THEN '\"' || LOWER(TRIM(COALESCE(TYP.USER_DEFINED_TYPE_NAME, C.USER_DEFINED_TYPE_NAME))) || '\"' " +
+                "ELSE TRIM(COALESCE(TYP.SOURCE_TYPE, C.DATA_TYPE)) END
+```
