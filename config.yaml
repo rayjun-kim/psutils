@@ -1,0 +1,271 @@
+# ============================================================
+# Migration Tool Configuration
+# ============================================================
+# This file holds connection names, schema, and behavior settings
+# only - the queries and type-mapping data needed to migrate a
+# given source database live in that source's own directory under
+# sources/<active_source>/ (see gather_table_info.hpl,
+# migrate_table.hpl, apply_constraints.hpl, type_mapping.yaml there).
+#
+# To add support for a new source database (Oracle, MySQL, etc.),
+# create sources/<new_source>/ with those same four files, add a
+# matching general.ASIS.<new_source> block below, and point
+# active_source at it. No changes to the shared pipelines
+# (load_config.hpl / migration.hwf) are needed.
+# ============================================================
+
+general:
+
+  ASIS:
+    # Selects which source block below is active, and which
+    # directory under sources/ supplies that source's queries and
+    # type mappings. Must match both a key here and a directory name
+    # exactly (case-sensitive).
+    active_source: db2_for_i
+
+    db2_for_i:
+      # Hop connection name used for both catalog lookups and data reads.
+      connection: ASIS
+
+      # Schema/library to migrate.
+      schema: <YOUR_AS400_LIBRARY>
+
+    # oracle:
+    #   connection: <Hop connection name>
+    #   schema: <schema>
+
+  # Target is always EPAS, loaded via edb*loader.
+  TOBE:
+    connection: TOBE
+    schema: public
+
+    # Path to the edbldr binary. Must be installed on (and match the
+    # OS/architecture of) whichever host actually runs Hop - edbldr is
+    # always executed locally to Hop, connecting outward to EPAS over
+    # the network (like any database client). It does not need to run
+    # on the EPAS host itself.
+    edbldr_path: <PATH_TO_EDBLDR_BINARY>
+
+    # Character set used for edbldr's CHARACTERSET clause and for
+    # encoding the STDIN byte stream. Must match EPAS's server_encoding.
+    edbldr_charset: UTF8
+
+    # edbldr ROWS= : number of rows per commit/bind batch. This is
+    # entirely internal to edbldr, on data it has already received over
+    # stdin - it controls how often edbldr commits, not how fast rows
+    # arrive at its stdin. A different, unrelated setting -
+    # write_batch_rows below - controls that.
+    edbldr_rows: 1000
+
+    # edbldr ERRORS= : maximum rejected rows tolerated before a load
+    # is considered failed.
+    edbldr_errors: 1000
+
+    # Number of source rows this tool buffers before making one
+    # write() call to edbldr's stdin, instead of one write() call per
+    # row. Not an edbldr option - purely this tool's own client-side
+    # batching, unrelated to edbldr_rows above (which only affects
+    # edbldr's commit frequency on data it has already received).
+    # Added after live testing showed the per-row write loop itself
+    # pegging >100% CPU with no improvement from source-side fetch
+    # tuning or target-side DIRECT-path loading - i.e. the per-row
+    # write()/encode() call overhead was the actual bottleneck, not
+    # network or target-commit behavior. Larger values amortize that
+    # overhead across more rows (fewer, bigger writes) at the cost of
+    # holding more unflushed rows in memory if the process dies
+    # mid-table (that row range would need to be reloaded from
+    # scratch on retry, same as any other failure this tool already
+    # handles via TRUNCATE-before-load - see the load task's own
+    # comments on "table not (re)validated this run").
+    write_batch_rows: 1000
+
+    # edbldr DIRECT= : use direct-path loading. Verified restrictions
+    # that edbldr/EPAS enforce (fail the load rather than falling back
+    # automatically, so these must be avoided by configuration or by the
+    # state of the target table):
+    #   - Not supported when loading into a partitioned table
+    #     ("direct load into partition table not currently supported").
+    #   - Not supported together with edbldr_handle_conflicts: true
+    #     ("HANDLE_CONFLICTS option is not supported with direct load").
+    #   - The target table must have no triggers, CHECK constraints, or
+    #     FOREIGN KEY constraints (in either direction) - apply_constraints/
+    #     apply_check_constraints only run *after* every table has loaded,
+    #     so this is only a concern when re-running DIRECT against a table
+    #     that already has constraints from a prior full run.
+    edbldr_direct: false
+
+    # edbldr PARALLEL= : allow concurrent direct-path loads into the same
+    # table. Only meaningful when edbldr_direct is true. edbldr rejects
+    # PARALLEL=TRUE together with its own TRUNCATE INTO TABLE ("only
+    # APPEND option is supported with PARALLEL load") - migrate_table.hpl
+    # works around this by TRUNCATEing the table itself (via SQL, in
+    # "Generate table DDL") and using APPEND INTO TABLE in edbldr's
+    # control file instead, so PARALLEL: true works with no extra setup.
+    edbldr_parallel: false
+
+    # edbldr SKIP_INDEX_MAINTENANCE= : defer index maintenance during
+    # the load.
+    edbldr_skip_index_maintenance: false
+
+    # edbldr HANDLE_CONFLICTS= : isolate constraint-violating rows
+    # instead of failing the whole load. Cannot be combined with
+    # edbldr_direct: true - see the note there.
+    edbldr_handle_conflicts: true
+
+    # edbldr.empty_csv_field (EPAS server-side GUC - not a control-file
+    # keyword, so it is set here via the edbldr process's PGOPTIONS
+    # environment variable, not the .ctl file). Controls whether a
+    # zero-length delimited field loads as NULL or as an empty string:
+    #   pgsql        - quoted empty field -> '', unquoted -> NULL
+    #                  (matches Postgres COPY semantics; recommended)
+    #   null         - every empty field -> NULL, regardless of quoting
+    #   empty_string - every empty field -> '', regardless of quoting
+    #   "" (empty)   - do not set PGOPTIONS at all; whatever EPAS's own
+    #                  server-wide default for this GUC already is
+    #                  applies (this is the toggle-off setting).
+    edbldr_empty_csv_field: pgsql
+
+    # Working directory for generated control/parameter files and
+    # per-table .bad/.log files.
+    edbldr_work_dir: ${PROJECT_HOME}/edbldr_work
+
+  # Number of tables migrated concurrently. This controls how many
+  # different tables are processed in parallel, not how a single
+  # table's own load is parallelized - a single table is always
+  # extracted and loaded by one sequential pipeline instance.
+  parallelism: 4
+
+  # Maximum JVM heap size for the hop-run.sh process that actually runs
+  # the migration (Xmx). Apache Hop bakes a fixed 2g default into
+  # hop-run.sh itself - it does not size itself dynamically based on
+  # what's being migrated. edb-hop.sh --run exports this as HOP_OPTIONS
+  # before invoking hop-run.sh, overriding that built-in default.
+  # Relevant to raise if you increase parallelism and/or
+  # general.TOBE.write_batch_rows together: parallelism copies of the
+  # per-table pipeline run as threads inside this one JVM (not separate
+  # processes), and each buffers up to write_batch_rows rows of CSV text
+  # in memory before flushing to edbldr - so peak memory use scales with
+  # parallelism x write_batch_rows x (average row size). Accepts any
+  # value the JVM's own -Xmx understands (e.g. "512m", "2g", "4096m").
+  hop_heap_size: 2g
+
+  # Controls what happens when a table fails to migrate (source read
+  # error, edbldr load failure, etc.):
+  #   true  - stop the entire run as soon as any table fails. Safest
+  #           default, recommended when a failure likely indicates a
+  #           systemic problem (bad credentials, target unreachable)
+  #           rather than an issue with one table.
+  #   false - record the failure and keep processing the remaining
+  #           tables. Failed tables are skipped on success but retried
+  #           automatically on the next run (see resume_from_checkpoint
+  #           below), so nothing needs to be done manually to recover -
+  #           just run the migration again.
+  fail_fast: true
+
+
+migration:
+
+  # When enabled, a partitioned source table is migrated to a matching
+  # declarative-partitioned Postgres table (parent + child partitions
+  # created up front), and data is loaded directly into the parent -
+  # Postgres routes each row to the correct child itself. See
+  # sources/<active_source>/migrate_table.hpl for the source-specific
+  # partition detection query and boundary-conversion rules.
+  detect_partitions: true
+
+  # ------------------------------------------------------------
+  # Constraints
+  # ------------------------------------------------------------
+  # Constraints are applied in a separate pipeline stage that runs
+  # after all tables have finished loading (not per-table), since
+  # foreign keys require referenced tables to already be populated,
+  # and building indexes after a bulk load is faster than maintaining
+  # them during it. See sources/<active_source>/apply_constraints.hpl
+  # for the source-specific constraint queries.
+  # ------------------------------------------------------------
+
+  # Create PRIMARY KEY / UNIQUE / FOREIGN KEY constraints.
+  apply_constraints: false
+
+  # Also create CHECK constraints. Kept separate from
+  # apply_constraints because CHECK expressions are copied from the
+  # source as raw SQL text and may use source-specific syntax that
+  # does not translate cleanly to Postgres; a failure here is
+  # recorded per constraint rather than aborting the run. A CHECK
+  # constraint disabled in DB2 for i (QSYS2.SYSCST.ENABLED = 'NO') is
+  # skipped rather than created, matching the source's own enforcement.
+  apply_check_constraints: false
+
+  # Also create standalone indexes (CREATE INDEX, not the indexes
+  # PRIMARY KEY/UNIQUE already create as a side effect of
+  # apply_constraints). Uses CREATE INDEX IF NOT EXISTS, so an index
+  # whose name happens to already exist (e.g. a PK's own backing
+  # index) is a safe no-op; one whose DB2-side name differs from its
+  # constraint's Postgres index name creates a harmless but redundant
+  # duplicate index instead of erroring - index identity is matched by
+  # name only, not by column list.
+  apply_indexes: false
+
+  # ------------------------------------------------------------
+  # Checkpoint / resume
+  # ------------------------------------------------------------
+  # Progress is recorded in a SQLite database (created automatically
+  # on first use). When enabled, each pipeline stage checks this
+  # store before doing any work and skips units (tables, or table
+  # phases) already marked successful, so a re-run after a partial
+  # failure resumes rather than starting over.
+  #
+  # To force a full re-run, pass RESET_STATUS=true as a run parameter
+  # rather than changing this file - a file-based switch left on
+  # would silently wipe progress on every subsequent run.
+  # ------------------------------------------------------------
+  resume_from_checkpoint: true
+  status_db_path: ${PROJECT_HOME}/migration_status.db
+
+  # ------------------------------------------------------------
+  # Table selection (source-agnostic - applies no matter which
+  # active_source is selected above; every source's own
+  # gather_table_info.hpl is responsible for honoring these)
+  # ------------------------------------------------------------
+
+  # If non-empty, ONLY the tables listed here are migrated - every
+  # other table in the source schema is skipped, as if it didn't
+  # exist. Leave empty (the default) to migrate every table.
+  #
+  # table_select: [T_EMPLOYEE, T_DEPARTMENT]
+  table_select: []
+
+  # Tables to skip entirely. Only meaningful when table_select is
+  # empty (table_select already limits migration to just its own
+  # list, so nothing else is left to exclude).
+  #
+  # table_exclude: [T_AUDIT_LOG]
+  table_exclude: []
+
+  # Per-table override of the extraction query, keyed by table name.
+  # Only takes effect for a table also listed in table_select above -
+  # an entry here for a table not in table_select is ignored, and it
+  # has no effect at all if table_select is empty. The query must
+  # still return every column of the table, in the same names/types
+  # the source catalog reports for it (this feeds the same load path
+  # as the default "SELECT * FROM <schema>.<table>") - use this to add
+  # a WHERE clause or similar filter, not to reshape the row itself.
+  #
+  # table_select: [T_SOME_TABLE]
+  # table_select_query:
+  #   T_SOME_TABLE: "SELECT * FROM SOMESCHEMA.T_SOME_TABLE WHERE STATUS = 'ACTIVE'"
+  table_select_query: {}
+
+  # ------------------------------------------------------------
+  # Per-table/column overrides (highest priority)
+  # ------------------------------------------------------------
+  # Forces an exact Postgres type for a specific table's column,
+  # regardless of what sources/<active_source>/type_mapping.yaml
+  # would otherwise choose. Values are complete Postgres type strings
+  # (no {length}/{scale} substitution).
+  #
+  # overrides:
+  #   T_SOME_TABLE:
+  #     SOME_COLUMN: "VARCHAR(4000)"
+  # ------------------------------------------------------------
+  overrides: {}

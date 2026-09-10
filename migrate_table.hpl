@@ -1,0 +1,1371 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pipeline>
+  <info>
+    <pipeline_version/>
+    <capture_transform_performance>N</capture_transform_performance>
+    <transform_performance_capturing_delay>1000</transform_performance_capturing_delay>
+    <transform_performance_capturing_size_limit>100</transform_performance_capturing_size_limit>
+    <pipeline_type>Normal</pipeline_type>
+    <pipeline_status>0</pipeline_status>
+    <parameters>
+      <parameter>
+        <name>TABLE_NAME</name>
+        <description/>
+        <default_value/>
+      </parameter>
+      <parameter>
+        <name>EXTRACT_QUERY</name>
+        <description>Resolved by gather_table_info.hpl: either config.yaml's migration.table_select_query override for this table, or the default "SELECT * FROM SCHEMA.TABLE".</description>
+        <default_value/>
+      </parameter>
+    </parameters>
+    <name>migrate_table</name>
+    <name_sync_with_filename>Y</name_sync_with_filename>
+    <description/>
+    <extended_description/>
+    <created_user>-</created_user>
+    <modified_user>-</modified_user>
+    <created_date>2026/08/21 00:00:00.000</created_date>
+    <modified_date>2026/08/21 00:00:00.000</modified_date>
+  </info>
+  <transform>
+    <type>TableInput</type>
+    <name>ASIS</name>
+    <sql>${EXTRACT_QUERY}</sql>
+    <limit>0</limit>
+    <execute_each_row>N</execute_each_row>
+    <variables_active>Y</variables_active>
+    <connection>${SRC_CONNECTION}</connection>
+    <lookup/>
+    <sql_from_file/>
+    <distribute>Y</distribute>
+    <copies>1</copies>
+    <GUI>
+      <xloc>48</xloc>
+      <yloc>48</yloc>
+    </GUI>
+    <partitioning>
+      <method>none</method>
+      <schema_name/>
+    </partitioning>
+    <attributes/>
+  </transform>
+  <transform>
+    <name>Load via edbldr</name>
+    <type>UserDefinedJavaClass</type>
+    <description/>
+    <distribute>Y</distribute>
+    <custom_distribution/>
+    <copies>1</copies>
+    <partitioning>
+      <method>none</method>
+      <schema_name/>
+    </partitioning>
+    <definitions>
+      <definition>
+        <class_type>TRANSFORM_CLASS</class_type>
+        <class_name>Processor</class_name>
+        <class_source>
+private java.lang.Process edbldrProcess;
+private java.io.OutputStream edbldrStdin;
+private Thread edbldrOutputReader;
+private StringBuffer edbldrOutputBuffer;
+private String targetTable;
+private String ctlFilePath;
+private String badFilePath;
+private String logFilePath;
+private String parFilePath;
+private String edbHost;
+private String edbPort;
+private String edbDbName;
+private String edbUser;
+private String edbPassword;
+private String edbldrBin;
+private String charsetName;
+private String tgtSchema;
+private String edbldrRows;
+private String edbldrErrors;
+private boolean edbldrDirect;
+private boolean edbldrParallel;
+private boolean edbldrSkipIndexMaintenance;
+private boolean edbldrHandleConflicts;
+private String edbldrEmptyCsvField;
+private org.apache.hop.core.row.IRowMeta rowMetaRef;
+private boolean resumeFromCheckpoint;
+private String statusDbPath;
+private boolean preflight;
+private String tgtConnName;
+private java.util.List identityColumns;
+
+// Rows are batched into this buffer and flushed to edbldr's stdin every
+// rowBatchSize rows, instead of one write() call per row - measured
+// (170% CPU on a single table load, no improvement from either JDBC
+// fetch-size tuning or DIRECT-path loading) to be CPU/call-overhead bound
+// in this per-row Java loop itself, not source fetch latency or target
+// commit/WAL behavior (edbldr_rows/ROWS= made no difference either -
+// that only controls edbldr's own commit frequency on data it has
+// already received, unrelated to how fast this loop hands data to it).
+// This does not overlap fetching the next row with writing the current
+// one (still a single thread) - it only amortizes the per-row
+// String-&gt;byte[] conversion and OutputStream.write() call overhead
+// across many rows at once. Read from config.yaml's write_batch_rows -
+// a separate, unrelated setting from edbldr_rows (ROWS=), which only
+// controls edbldr's own commit frequency on data already received.
+private int rowBatchSize;
+private StringBuffer rowBatch;
+private int rowBatchCount;
+
+private String q(String identifier) {
+  return "\"" + identifier.toLowerCase() + "\"";
+}
+
+private String qq(String schema, String name) {
+  return "\"" + schema.toLowerCase() + "\".\"" + name.toLowerCase() + "\"";
+}
+
+public boolean processRow() throws HopException
+{
+  Object[] r = getRow();
+
+  if (first) {
+    first = false;
+    targetTable = getVariable("TABLE_NAME");
+    rowMetaRef = getInputRowMeta();
+    rowBatch = new StringBuffer();
+    rowBatchCount = 0;
+    resumeFromCheckpoint = Boolean.parseBoolean(getVariable("RESUME_FROM_CHECKPOINT", "false"));
+    statusDbPath = getVariable("STATUS_DB_PATH");
+    preflight = Boolean.parseBoolean(getVariable("PREFLIGHT", "false"));
+
+    java.util.Map tobeCfg = null;
+    try {
+      String configPath = getVariable("PROJECT_HOME") + "/config.yaml";
+      java.io.FileInputStream fis = new java.io.FileInputStream(configPath);
+      org.yaml.snakeyaml.Yaml yaml = new org.yaml.snakeyaml.Yaml();
+      Object loaded = yaml.load(fis);
+      fis.close();
+      java.util.Map root = (java.util.Map) loaded;
+      java.util.Map general = (java.util.Map) root.get("general");
+      tobeCfg = (java.util.Map) general.get("TOBE");
+    } catch (Exception e) {
+      logError("Could not read config.yaml: " + e.getMessage());
+    }
+
+    if (tobeCfg == null) {
+      logError("No 'general.TOBE' section found in config.yaml");
+      recordLoadStatus("FAILED", "No 'general.TOBE' section found in config.yaml");
+      setErrors(1);
+      setOutputDone();
+      return false;
+    }
+
+    tgtConnName = String.valueOf(tobeCfg.get("connection"));
+    tgtSchema = String.valueOf(tobeCfg.get("schema"));
+
+    charsetName = String.valueOf(tobeCfg.get("edbldr_charset"));
+    try {
+      java.nio.charset.Charset.forName(charsetName);
+    } catch (Exception e) {
+      logError("edbldr_charset '" + charsetName + "' is not a recognized charset (" + e.getMessage() + ") - falling back to UTF-8");
+      charsetName = "UTF-8";
+    }
+
+    try {
+      org.apache.hop.core.database.DatabaseMeta tgtDbMeta =
+        (org.apache.hop.core.database.DatabaseMeta) getParent().getMetadataProvider()
+          .getSerializer(org.apache.hop.core.database.DatabaseMeta.class)
+          .load(tgtConnName);
+      edbHost = tgtDbMeta.getHostname();
+      edbPort = tgtDbMeta.getPort();
+      edbDbName = tgtDbMeta.getDatabaseName();
+      edbUser = tgtDbMeta.getUsername();
+      edbPassword = org.apache.hop.core.encryption.Encr.decryptPasswordOptionallyEncrypted(tgtDbMeta.getPassword());
+    } catch (Exception e) {
+      logError("Could not resolve " + tgtConnName + " connection info: " + e.getMessage());
+      recordLoadStatus("FAILED", "Could not resolve " + tgtConnName + " connection info: " + e.getMessage());
+      setErrors(1);
+      setOutputDone();
+      return false;
+    }
+
+    edbldrBin = String.valueOf(tobeCfg.get("edbldr_path"));
+
+    String workDirTemplate = String.valueOf(tobeCfg.get("edbldr_work_dir"));
+    String workDir = workDirTemplate.replace("${PROJECT_HOME}", getVariable("PROJECT_HOME"));
+    new java.io.File(workDir).mkdirs();
+
+    // "Generate table DDL" writes this marker (and forwards no rows)
+    // when it could not (re)validate the table's structure this run.
+    // Without this check, this transform's setup below runs on its
+    // very first processRow() call regardless of whether any row ever
+    // arrives (r can already be null on that first call) - so it
+    // would still build a control file from whatever .columns file
+    // happens to be on disk (possibly stale, from a previous
+    // successful run) and run edbldr, which TRUNCATEs the real target
+    // table as part of LOAD DATA before it even gets to loading (zero)
+    // rows. Checking for the marker first prevents that.
+    java.io.File ddlFailedMarker = new java.io.File(workDir + "/" + targetTable + ".ddlfailed");
+    if (ddlFailedMarker.exists()) {
+      logError("Skipping edbldr load for " + targetTable + " - DDL/catalog setup failed this run (see Generate table DDL's errors above).");
+      recordLoadStatus("FAILED", "DDL/catalog setup failed - table not (re)validated this run");
+      setErrors(1);
+      setOutputDone();
+      return false;
+    }
+
+    ctlFilePath = workDir + "/" + targetTable + ".ctl";
+    badFilePath = workDir + "/" + targetTable + ".bad";
+    logFilePath = workDir + "/" + targetTable + ".log";
+    parFilePath = workDir + "/" + targetTable + ".par";
+
+    // Written by "Generate table DDL" only when this table has at least
+    // one GENERATED BY DEFAULT AS IDENTITY column - read here so the
+    // sequence(s) can be resynced to MAX(id)+1 once the load below
+    // finishes successfully (see that transform's IDENTITY handling for
+    // why the sequence needs resyncing at all).
+    identityColumns = new java.util.ArrayList();
+    try {
+      java.io.File identityFile = new java.io.File(workDir + "/" + targetTable + ".identity");
+      if (identityFile.exists()) {
+        java.io.BufferedReader ibr = new java.io.BufferedReader(new java.io.FileReader(identityFile));
+        String idLine = ibr.readLine();
+        ibr.close();
+        if (idLine != null &amp;&amp; idLine.length() &gt; 0) {
+          String[] idCols = idLine.split(",");
+          for (int i = 0; i &lt; idCols.length; i++) {
+            identityColumns.add(idCols[i]);
+          }
+        }
+      }
+    } catch (Exception e) {
+      logError("Could not read identity column list for " + targetTable + ": " + e.getMessage());
+    }
+
+    edbldrRows = String.valueOf(tobeCfg.get("edbldr_rows"));
+    edbldrErrors = String.valueOf(tobeCfg.get("edbldr_errors"));
+    try {
+      rowBatchSize = Integer.parseInt(String.valueOf(tobeCfg.get("write_batch_rows")));
+      if (rowBatchSize &lt;= 0) {
+        throw new NumberFormatException("write_batch_rows must be positive");
+      }
+    } catch (Exception e) {
+      logError("config.yaml's write_batch_rows is missing or invalid (" + e.getMessage() + ") - defaulting to 1000");
+      rowBatchSize = 1000;
+    }
+    edbldrDirect = Boolean.parseBoolean(String.valueOf(tobeCfg.get("edbldr_direct")));
+    edbldrParallel = Boolean.parseBoolean(String.valueOf(tobeCfg.get("edbldr_parallel")));
+    edbldrSkipIndexMaintenance = Boolean.parseBoolean(String.valueOf(tobeCfg.get("edbldr_skip_index_maintenance")));
+    edbldrHandleConflicts = Boolean.parseBoolean(String.valueOf(tobeCfg.get("edbldr_handle_conflicts")));
+    edbldrEmptyCsvField = tobeCfg.get("edbldr_empty_csv_field") == null
+      ? "" : String.valueOf(tobeCfg.get("edbldr_empty_csv_field")).trim();
+
+    // USERID goes into a parameter file with owner-only permissions
+    // instead of on the command line, so it is not visible via ps/
+    // /proc/&lt;pid&gt;/cmdline while edbldr is running (edbldr --help
+    // confirms PARFILE= is a supported keyword alongside the others).
+    try {
+      java.io.FileWriter parWriter = new java.io.FileWriter(parFilePath);
+      parWriter.write("USERID=" + edbUser + "/" + edbPassword + "\n");
+      parWriter.close();
+      java.nio.file.Files.setPosixFilePermissions(
+        java.nio.file.Paths.get(parFilePath),
+        java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+    } catch (Exception e) {
+      logError("Could not write parameter file " + parFilePath + ": " + e.getMessage());
+      recordLoadStatus("FAILED", "Could not write parameter file " + parFilePath + ": " + e.getMessage());
+      setErrors(1);
+      setOutputDone();
+      return false;
+    }
+
+    StringBuffer ctl = new StringBuffer();
+    ctl.append("LOAD DATA\n");
+    ctl.append("CHARACTERSET ").append(charsetName).append("\n");
+    ctl.append("INFILE 'stdin'\n");
+    ctl.append("BADFILE '").append(badFilePath).append("'\n");
+    // APPEND, not TRUNCATE - the target table is already explicitly
+    // TRUNCATEd (via SQL, in "Generate table DDL") before this step ever
+    // runs, so APPEND here is behaviorally equivalent for a normal load
+    // but - unlike TRUNCATE INTO TABLE - is also compatible with
+    // PARALLEL=TRUE (edbldr rejects TRUNCATE+PARALLEL: "only APPEND
+    // option is supported with PARALLEL load").
+    ctl.append("APPEND INTO TABLE ").append(qq(tgtSchema, targetTable)).append("\n");
+    ctl.append("FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"'\n");
+    ctl.append("TRAILING NULLCOLS\n");
+    ctl.append("(\n");
+    String columnListCsv = "";
+    try {
+      String columnsFilePath = workDir + "/" + targetTable + ".columns";
+      java.io.BufferedReader cbr = new java.io.BufferedReader(new java.io.FileReader(columnsFilePath));
+      columnListCsv = cbr.readLine();
+      cbr.close();
+    } catch (Exception e) {
+      logError("Could not read column list file for " + targetTable + ": " + e.getMessage());
+    }
+    String[] columnNames = columnListCsv == null ? new String[0] : columnListCsv.split(",");
+    for (int i = 0; i &lt; columnNames.length; i++) {
+      if (i &gt; 0) {
+        ctl.append(",\n");
+      }
+      ctl.append(q(columnNames[i]));
+    }
+    ctl.append("\n)\n");
+
+    try {
+      java.io.FileWriter fw = new java.io.FileWriter(ctlFilePath);
+      fw.write(ctl.toString());
+      fw.close();
+    } catch (Exception e) {
+      logError("Could not write control file " + ctlFilePath + ": " + e.getMessage());
+      recordLoadStatus("FAILED", "Could not write control file " + ctlFilePath + ": " + e.getMessage());
+      setErrors(1);
+      setOutputDone();
+      return false;
+    }
+
+    if (!startEdbldrProcess()) {
+      recordLoadStatus("FAILED", "Could not start edbldr process for " + targetTable);
+      setErrors(1);
+      setOutputDone();
+      return false;
+    }
+  }
+
+  if (r == null) {
+    flushRowBatch();
+    boolean ok = finishAndVerify();
+    if (!ok) {
+      setErrors(getErrors() + 1);
+      recordLoadStatus("FAILED", "edbldr load failed - see " + logFilePath);
+    } else {
+      recordLoadStatus("SUCCESS", null);
+    }
+    setOutputDone();
+    return false;
+  }
+
+  String line = formatRowAsCsv(rowMetaRef, r);
+  rowBatch.append(line).append('\n');
+  rowBatchCount++;
+  if (rowBatchCount &gt;= rowBatchSize) {
+    flushRowBatch();
+  }
+
+  putRow(rowMetaRef, r);
+  return true;
+}
+
+// Writes every row accumulated in rowBatch since the last flush to
+// edbldr's stdin in a single write() call, then clears the buffer. A
+// no-op when nothing is buffered (safe to call unconditionally at
+// end-of-stream even if the last partial batch is empty).
+private void flushRowBatch() {
+  if (rowBatchCount == 0) {
+    return;
+  }
+  if (edbldrStdin != null) {
+    try {
+      edbldrStdin.write(rowBatch.toString().getBytes(charsetName));
+    } catch (Exception e) {
+      logError("Failed writing batched rows to edbldr stdin for " + targetTable + ": " + e.getMessage());
+    }
+  }
+  // Always reset, even if edbldrStdin was null above (matches the old
+  // per-row code's own "if (edbldrStdin != null)" guard) - otherwise
+  // rowBatch would grow unbounded for the rest of this table's rows
+  // instead of just silently dropping them as the old code did.
+  rowBatch.setLength(0);
+  rowBatchCount = 0;
+}
+
+private void recordLoadStatus(String status, String errorMessage) {
+  // Never record a preflight table load to the checkpoint db, success
+  // or failure - a preflight run only moves preflightLimit rows, and a
+  // recorded SUCCESS would make a later real run's checkpoint lookup
+  // (see gather_table_info.hpl) skip that table as already done,
+  // silently leaving just those few rows behind for good.
+  if (preflight || !resumeFromCheckpoint || statusDbPath == null || statusDbPath.length() == 0) {
+    return;
+  }
+  org.apache.hop.core.database.Database statusDb = null;
+  try {
+    org.apache.hop.core.database.DatabaseMeta statusDbMeta =
+      (org.apache.hop.core.database.DatabaseMeta) getParent().getMetadataProvider()
+        .getSerializer(org.apache.hop.core.database.DatabaseMeta.class)
+        .load("STATUS_DB");
+    statusDb = new org.apache.hop.core.database.Database(getParent(), getParent(), statusDbMeta);
+    statusDb.connect();
+    java.sql.Connection conn = statusDb.getConnection();
+    java.sql.Statement pragma = conn.createStatement();
+    pragma.execute("PRAGMA busy_timeout=30000");
+    pragma.close();
+    java.sql.PreparedStatement ps = conn.prepareStatement(
+      "INSERT INTO migration_status (table_name, partition_name, phase, status, attempted_at, error_message) "
+      + "VALUES (?, '', 'load', ?, ?, ?) "
+      + "ON CONFLICT(table_name, partition_name, phase) DO UPDATE SET status=excluded.status, attempted_at=excluded.attempted_at, error_message=excluded.error_message");
+    ps.setString(1, targetTable);
+    ps.setString(2, status);
+    ps.setString(3, new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date()));
+    ps.setString(4, errorMessage);
+    ps.executeUpdate();
+    ps.close();
+  } catch (Exception e) {
+    logError("Could not record checkpoint status for " + targetTable + ": " + e.getMessage());
+  } finally {
+    if (statusDb != null) {
+      statusDb.disconnect();
+    }
+  }
+}
+
+private boolean startEdbldrProcess() {
+  try {
+    java.util.List cmd = new java.util.ArrayList();
+    cmd.add(edbldrBin);
+    cmd.add("-d");
+    cmd.add(edbDbName);
+    cmd.add("-h");
+    cmd.add(edbHost);
+    cmd.add("-p");
+    cmd.add(edbPort);
+    cmd.add("PARFILE=" + parFilePath);
+    cmd.add("CONTROL=" + ctlFilePath);
+    cmd.add("BAD=" + badFilePath);
+    cmd.add("LOG=" + logFilePath);
+    cmd.add("ERRORS=" + edbldrErrors);
+    cmd.add("ROWS=" + edbldrRows);
+    cmd.add("DIRECT=" + (edbldrDirect ? "TRUE" : "FALSE"));
+    cmd.add("PARALLEL=" + (edbldrParallel ? "TRUE" : "FALSE"));
+    cmd.add("SKIP_INDEX_MAINTENANCE=" + (edbldrSkipIndexMaintenance ? "TRUE" : "FALSE"));
+    cmd.add("HANDLE_CONFLICTS=" + (edbldrHandleConflicts ? "TRUE" : "FALSE"));
+
+    java.lang.ProcessBuilder pb = new java.lang.ProcessBuilder(cmd);
+    // edbldr's own NULL-vs-empty-string determination for delimited
+    // fields is controlled by the EPAS server-side GUC
+    // edbldr.empty_csv_field, not by anything in the control file - it
+    // is a session-level parameter, set here via PGOPTIONS rather than
+    // a global server setting. Toggled/chosen via config.yaml's
+    // edbldr_empty_csv_field (general.TOBE): "pgsql" matches Postgres
+    // COPY semantics (quoted empty = '', unquoted empty = NULL - what
+    // formatRowAsCsv's quoting below produces); "null"/"empty_string"
+    // select edbldr's other two modes explicitly; empty/unset leaves
+    // PGOPTIONS untouched, i.e. off - whatever EPAS itself defaults to.
+    if (edbldrEmptyCsvField.equalsIgnoreCase("pgsql")
+        || edbldrEmptyCsvField.equalsIgnoreCase("null")
+        || edbldrEmptyCsvField.equalsIgnoreCase("empty_string")) {
+      pb.environment().put("PGOPTIONS", "-c edbldr.empty_csv_field=" + edbldrEmptyCsvField.toLowerCase());
+    } else if (!edbldrEmptyCsvField.isEmpty()) {
+      logError("edbldr_empty_csv_field '" + edbldrEmptyCsvField + "' is not one of null/empty_string/pgsql - leaving it unset (EPAS server default applies)");
+    }
+    pb.redirectErrorStream(true);
+    edbldrProcess = pb.start();
+    edbldrStdin = new java.io.BufferedOutputStream(edbldrProcess.getOutputStream(), 65536);
+
+    // edbldr's combined stdout/stderr must be drained continuously,
+    // not only after we finish writing stdin: if edbldr's own output
+    // (progress/commit messages, rejected-row notices, ...) fills the
+    // OS pipe buffer (~64KB) while rows are still being written, edbldr
+    // blocks on its own stdout write and stops reading stdin, and we
+    // block writing stdin - a mutual deadlock. A dedicated reader
+    // thread keeps that pipe empty for the whole life of the process.
+    final java.io.InputStream edbldrStdout = edbldrProcess.getInputStream();
+    edbldrOutputBuffer = new StringBuffer();
+    final StringBuffer outputRef = edbldrOutputBuffer;
+    edbldrOutputReader = new Thread(new Runnable() {
+      public void run() {
+        byte[] buf = new byte[4096];
+        int n;
+        try {
+          while ((n = edbldrStdout.read(buf)) != -1) {
+            String chunk = new String(buf, 0, n);
+            synchronized (outputRef) {
+              outputRef.append(chunk);
+            }
+          }
+        } catch (Exception e) {
+          // stream closed when the process ends - nothing to do
+        }
+      }
+    });
+    edbldrOutputReader.setDaemon(true);
+    edbldrOutputReader.start();
+
+    return true;
+  } catch (Exception e) {
+    logError("Could not start edbldr process for " + targetTable + ": " + e.getMessage());
+    return false;
+  }
+}
+
+private boolean finishAndVerify() {
+  try {
+    if (edbldrStdin != null) {
+      edbldrStdin.close();
+    }
+  } catch (Exception e) {
+    // ignore
+  }
+
+  int exitCode = -1;
+  try {
+    exitCode = edbldrProcess.waitFor();
+  } catch (Exception e) {
+    logError("Interrupted waiting for edbldr (" + targetTable + "): " + e.getMessage());
+  }
+
+  try {
+    if (edbldrOutputReader != null) {
+      edbldrOutputReader.join(5000);
+    }
+  } catch (Exception e) {
+    // ignore - fall through with whatever output was captured so far
+  }
+  String output;
+  synchronized (edbldrOutputBuffer) {
+    output = edbldrOutputBuffer.toString();
+  }
+
+  if (exitCode == 0) {
+    if (preflight) {
+      logBasic("PREFLIGHT: " + targetTable + " loaded (row-capped, not recorded to checkpoint - a real run will still process it in full). Output: " + output);
+    } else {
+      logBasic("edbldr loaded " + targetTable + " successfully. Output: " + output);
+    }
+    resyncIdentitySequences();
+    return true;
+  }
+
+  if (exitCode == 2) {
+    logError("edbldr completed " + targetTable + " with rejected/discarded rows (exit 2). Bad file: " + badFilePath + ". Output: " + output);
+    return false;
+  }
+
+  logError("edbldr failed for " + targetTable + " (exit " + exitCode + "). Output: " + output);
+  return false;
+}
+
+// GENERATED BY DEFAULT AS IDENTITY columns (see "Generate table DDL")
+// still have a sequence starting from DB2's IDENTITY_START, unaware of
+// the real historical id values edbldr just loaded - left alone, the
+// next plain INSERT would generate an id that already exists. Bumps
+// each identity column's sequence so its next value is MAX(id)+1 (or
+// exactly its DB2 IDENTITY_START-equivalent default of 1 for an empty
+// table).
+private void resyncIdentitySequences() {
+  if (identityColumns == null || identityColumns.isEmpty()) {
+    return;
+  }
+  org.apache.hop.core.database.Database tgtDb = null;
+  try {
+    org.apache.hop.core.database.DatabaseMeta tgtDbMeta =
+      (org.apache.hop.core.database.DatabaseMeta) getParent().getMetadataProvider()
+        .getSerializer(org.apache.hop.core.database.DatabaseMeta.class)
+        .load(tgtConnName);
+    tgtDb = new org.apache.hop.core.database.Database(getParent(), getParent(), tgtDbMeta);
+    tgtDb.connect();
+    for (int i = 0; i &lt; identityColumns.size(); i++) {
+      String col = (String) identityColumns.get(i);
+      String qualifiedTable = tgtSchema.toLowerCase() + "." + targetTable.toLowerCase();
+      String sql = "SELECT setval(pg_get_serial_sequence('" + qualifiedTable + "', '" + col.toLowerCase()
+        + "'), (SELECT COALESCE(MAX(" + q(col) + "), 0) FROM " + qq(tgtSchema, targetTable) + ") + 1, false)";
+      try {
+        tgtDb.execStatement(sql);
+      } catch (Exception e) {
+        logError("Could not resync identity sequence for " + targetTable + "." + col + ": " + e.getMessage());
+      }
+    }
+  } catch (Exception e) {
+    logError("Could not open target connection to resync identity sequences for " + targetTable + ": " + e.getMessage());
+  } finally {
+    if (tgtDb != null) {
+      tgtDb.disconnect();
+    }
+  }
+}
+
+private String formatRowAsCsv(org.apache.hop.core.row.IRowMeta rowMeta, Object[] row) {
+  StringBuffer sb = new StringBuffer();
+  for (int i = 0; i &lt; rowMeta.size(); i++) {
+    if (i &gt; 0) {
+      sb.append(",");
+    }
+    Object v = row[i];
+    String cell;
+    if (v == null) {
+      cell = "";
+    } else if (v instanceof byte[]) {
+      byte[] b = (byte[]) v;
+      String hexChars = "0123456789abcdef";
+      StringBuffer hex = new StringBuffer("\\x");
+      for (int k = 0; k &lt; b.length; k++) {
+        int val = b[k] &amp; 0xff;
+        hex.append(hexChars.charAt(val / 16));
+        hex.append(hexChars.charAt(val % 16));
+      }
+      cell = hex.toString();
+    } else {
+      try {
+        cell = rowMeta.getValueMeta(i).getString(v);
+      } catch (Exception e) {
+        cell = String.valueOf(v);
+      }
+    }
+
+    boolean isRealValue = (v != null);
+    if (cell != null &amp;&amp; (cell.indexOf(',') &gt;= 0 || cell.indexOf('"') &gt;= 0 || cell.indexOf('\n') &gt;= 0 || cell.indexOf('\r') &gt;= 0)) {
+      String escaped = cell.replace("\"", "\"\"");
+      sb.append('"').append(escaped).append('"');
+    } else if (isRealValue &amp;&amp; cell != null &amp;&amp; cell.length() == 0) {
+      // A real empty string must be quoted so it is distinguishable
+      // from NULL - both would otherwise serialize to the same
+      // unquoted empty field, and edbldr's TRAILING NULLCOLS treats
+      // an unquoted empty field as NULL.
+      sb.append("\"\"");
+    } else if (cell != null) {
+      sb.append(cell);
+    }
+  }
+  return sb.toString();
+}
+</class_source>
+      </definition>
+    </definitions>
+    <fields/>
+    <clear_result_fields>N</clear_result_fields>
+    <info_transforms/>
+    <target_transforms/>
+    <usage_parameters/>
+    <attributes/>
+    <GUI>
+      <xloc>336</xloc>
+      <yloc>48</yloc>
+    </GUI>
+  </transform>
+  <transform>
+    <name>Generate table DDL</name>
+    <type>UserDefinedJavaClass</type>
+    <description/>
+    <distribute>Y</distribute>
+    <custom_distribution/>
+    <copies>1</copies>
+    <partitioning>
+      <method>none</method>
+      <schema_name/>
+    </partitioning>
+    <definitions>
+      <definition>
+        <class_type>TRANSFORM_CLASS</class_type>
+        <class_name>Processor</class_name>
+        <class_source>
+private String q(String identifier) {
+  return "\"" + identifier.toLowerCase() + "\"";
+}
+
+private String qq(String schema, String name) {
+  return "\"" + schema.toLowerCase() + "\".\"" + name.toLowerCase() + "\"";
+}
+
+// DB2 for i column/type catalog query, composed rather than a single
+// static string (mirrors psql describe.c's approach of assembling a
+// query from pieces). {schema}/{table} are substituted here since this
+// file is already DB2-for-i-specific - no source-type branching needed.
+//
+// COL_CCSID: on DB2 for i, CCSID 65535 marks a "FOR BIT DATA" column -
+// it is catalogued as CHARACTER/VARCHAR/etc. but the actual values are
+// binary. UDT_NAME/UDT_SOURCE_TYPE resolve user-defined distinct types
+// (DB2 for i reports a UDT column's DATA_TYPE as simply "DISTINCT").
+//
+// The rest (from SYSCOLUMNS2, IBM's documented source for these) drive
+// nullability/DEFAULT/IDENTITY/computed-column/comment handling below:
+// IS_NULLABLE, HAS_DEFAULT/COLUMN_DEFAULT, IS_IDENTITY and its
+// IDENTITY_* generation settings, COLUMN_EXPRESSION (generated/computed
+// columns), and COALESCE(LONG_COMMENT, COLUMN_TEXT) (the COMMENT-
+// statement text, falling back to the shorter LABEL-statement text).
+private String buildCatalogQuery(String schema, String table) {
+  StringBuilder sql = new StringBuilder();
+  sql.append("SELECT ");
+  sql.append("C.COLUMN_NAME AS COL_NAME, ");
+  sql.append("C.DATA_TYPE AS DATA_TYPE, ");
+  sql.append("C.LENGTH AS COL_LENGTH, ");
+  sql.append("C.NUMERIC_SCALE AS COL_SCALE, ");
+  sql.append("C.CCSID AS COL_CCSID, ");
+  sql.append("C2.USER_DEFINED_TYPE_NAME AS UDT_NAME, ");
+  sql.append("T.SOURCE_TYPE AS UDT_SOURCE_TYPE, ");
+  sql.append("C2.IS_NULLABLE AS IS_NULLABLE, ");
+  sql.append("C2.HAS_DEFAULT AS HAS_DEFAULT, ");
+  sql.append("C2.COLUMN_DEFAULT AS COLUMN_DEFAULT, ");
+  sql.append("C2.IS_IDENTITY AS IS_IDENTITY, ");
+  sql.append("C2.IDENTITY_GENERATION AS IDENTITY_GENERATION, ");
+  sql.append("C2.IDENTITY_START AS IDENTITY_START, ");
+  sql.append("C2.IDENTITY_INCREMENT AS IDENTITY_INCREMENT, ");
+  sql.append("C2.IDENTITY_CYCLE AS IDENTITY_CYCLE, ");
+  sql.append("C2.COLUMN_EXPRESSION AS COLUMN_EXPRESSION, ");
+  sql.append("COALESCE(C2.LONG_COMMENT, C2.COLUMN_TEXT) AS COLUMN_COMMENT ");
+  sql.append("FROM QSYS2.SYSCOLUMNS C ");
+  sql.append("LEFT JOIN QSYS2.SYSCOLUMNS2 C2 ON C.TABLE_SCHEMA = C2.TABLE_SCHEMA AND C.TABLE_NAME = C2.TABLE_NAME AND C.COLUMN_NAME = C2.COLUMN_NAME ");
+  sql.append("LEFT JOIN QSYS2.SYSTYPES T ON C2.USER_DEFINED_TYPE_SCHEMA = T.USER_DEFINED_TYPE_SCHEMA AND C2.USER_DEFINED_TYPE_NAME = T.USER_DEFINED_TYPE_NAME ");
+  sql.append("WHERE C.TABLE_SCHEMA = '").append(schema).append("' AND C.TABLE_NAME = '").append(table).append("' ");
+  // Without this, column order is whatever QSYS2.SYSCOLUMNS happens to
+  // return, which is not guaranteed to match SELECT *'s column order -
+  // the .ctl file (built from this query's order) and the actual CSV
+  // data (built from SELECT *'s order) would then silently disagree.
+  sql.append("ORDER BY C.ORDINAL_POSITION");
+  return sql.toString();
+}
+
+// Table-level COMMENT/LABEL text - queried once per table, separately
+// from the per-column catalog query above.
+private String buildTableCommentQuery(String schema, String table) {
+  StringBuilder sql = new StringBuilder();
+  sql.append("SELECT COALESCE(LONG_COMMENT, TABLE_TEXT) AS TABLE_COMMENT ");
+  sql.append("FROM QSYS2.SYSTABLES ");
+  sql.append("WHERE TABLE_SCHEMA = '").append(schema).append("' AND TABLE_NAME = '").append(table).append("'");
+  return sql.toString();
+}
+
+// SYSCOLUMNS2's YES/NO-style flag columns (IS_NULLABLE, HAS_DEFAULT,
+// IS_IDENTITY, IDENTITY_CYCLE) - tolerate a bare 'Y' too rather than
+// assume the exact 'YES' spelling documented by IBM.
+private boolean isYes(Object flagObj) {
+  if (flagObj == null) {
+    return false;
+  }
+  String s = String.valueOf(flagObj).trim();
+  return s.equalsIgnoreCase("YES") || s.equalsIgnoreCase("Y");
+}
+
+private String sqlLiteral(String s) {
+  return "'" + s.replace("'", "''") + "'";
+}
+
+// Partition catalog query. PARTITION_TYPE is 'R' (range) or 'H' (hash).
+// LOWVALUE/HIGHVALUE come back from DB2 for i already formatted as a
+// literal usable directly in SQL for the column's type (e.g. a DATE
+// boundary is returned as the quoted string "'2025-01-31'", not a bare
+// date) - never re-quote them.
+private String buildPartitionQuery(String schema, String table) {
+  StringBuilder sql = new StringBuilder();
+  sql.append("SELECT TABLE_PARTITION, PARTITION_TYPE, PARTITION_NUMBER, ");
+  sql.append("LOWINCLUSIVE, LOWVALUE, HIGHINCLUSIVE, HIGHVALUE, PARTITIONING_KEYS ");
+  sql.append("FROM QSYS2.SYSPARTITIONSTAT ");
+  sql.append("WHERE TABLE_SCHEMA = '").append(schema).append("' AND TABLE_NAME = '").append(table).append("' ");
+  sql.append("ORDER BY PARTITION_NUMBER");
+  return sql.toString();
+}
+
+// Postgres declarative range partitioning is always FOR VALUES FROM (x)
+// TO (y) with x inclusive and y exclusive. DB2 for i's own boundaries
+// carry their own LOWINCLUSIVE/HIGHINCLUSIVE flags, which do not
+// necessarily match that convention, so a boundary must be nudged to
+// the next value (only supported for the range_boundary_supported_types
+// this file knows how to increment: DATE, INTEGER) whenever DB2's flag
+// disagrees with what Postgres needs at that end.
+private String nextValueExpr(String literal, String keyPgType) {
+  if ("DATE".equals(keyPgType)) {
+    // The explicit ::date cast on the literal itself is required, not
+    // optional: without it, "'2023-12-31' + INTERVAL '1 day'" is an
+    // unknown-type literal next to an interval, and Postgres's operator
+    // resolution can pick the interval+interval overload instead of
+    // date+interval - which then fails trying to parse the date string
+    // as an interval ("interval field value out of range"). This does
+    // not depend on whether the literal already arrives quoted from
+    // the source catalog; the cast disambiguates the operator, not the
+    // quoting.
+    return "(" + literal + "::date + INTERVAL '1 day')::date";
+  }
+  return "(" + literal + " + 1)";
+}
+
+private boolean isInclusive(Object flagObj) {
+  // Absent flag defaults to inclusive - matches every DB2 for i
+  // partition observed so far (LOWINCLUSIVE/HIGHINCLUSIVE = 'Y').
+  return flagObj == null || !"N".equalsIgnoreCase(String.valueOf(flagObj).trim());
+}
+
+public boolean processRow() throws HopException
+{
+  Object[] r = getRow();
+
+  if (first) {
+    first = false;
+
+    String tableName = getVariable("TABLE_NAME");
+    String configPath = getVariable("PROJECT_HOME") + "/config.yaml";
+    String activeSource = getVariable("ACTIVE_SOURCE");
+    String typeMappingPath = getVariable("PROJECT_HOME") + "/sources/" + activeSource + "/type_mapping.yaml";
+
+    java.util.Map overrides = null;
+    java.util.Map typeMapping = new java.util.HashMap();
+    java.util.List rangeBoundarySupportedTypes = new java.util.ArrayList();
+    String srcConnName = null;
+    String srcSchema = null;
+    String tgtConnName = null;
+    String tgtSchema = null;
+    String edbldrWorkDirTemplate = "${PROJECT_HOME}/edbldr_work";
+    boolean detectPartitions = true;
+
+    try {
+      java.io.FileInputStream fis = new java.io.FileInputStream(configPath);
+      org.yaml.snakeyaml.Yaml yaml = new org.yaml.snakeyaml.Yaml();
+      Object loaded = yaml.load(fis);
+      fis.close();
+
+      if (loaded instanceof java.util.Map) {
+        java.util.Map root = (java.util.Map) loaded;
+        java.util.Map general = (java.util.Map) root.get("general");
+        java.util.Map asisCfg = (java.util.Map) general.get("ASIS");
+        java.util.Map sourceCfg = (java.util.Map) asisCfg.get(activeSource);
+        srcConnName = String.valueOf(sourceCfg.get("connection"));
+        srcSchema = String.valueOf(sourceCfg.get("schema"));
+
+        java.util.Map tobeCfg = (java.util.Map) general.get("TOBE");
+        tgtConnName = String.valueOf(tobeCfg.get("connection"));
+        tgtSchema = String.valueOf(tobeCfg.get("schema"));
+        if (tobeCfg.get("edbldr_work_dir") != null) {
+          edbldrWorkDirTemplate = String.valueOf(tobeCfg.get("edbldr_work_dir"));
+        }
+
+        java.util.Map migration = (java.util.Map) root.get("migration");
+
+        Object overridesRootObj = migration.get("overrides");
+        if (overridesRootObj instanceof java.util.Map) {
+          java.util.Map overridesRoot = (java.util.Map) overridesRootObj;
+          Object tableEntry = overridesRoot.get(tableName);
+          if (tableEntry instanceof java.util.Map) {
+            overrides = (java.util.Map) tableEntry;
+          }
+        }
+
+        Object detectPartObj = migration.get("detect_partitions");
+        if (detectPartObj != null) {
+          detectPartitions = Boolean.parseBoolean(String.valueOf(detectPartObj));
+        }
+      }
+    } catch (Exception e) {
+      logError("Could not read config.yaml: " + e.getMessage());
+    }
+
+    try {
+      java.io.FileInputStream tfis = new java.io.FileInputStream(typeMappingPath);
+      org.yaml.snakeyaml.Yaml tyaml = new org.yaml.snakeyaml.Yaml();
+      Object tloaded = tyaml.load(tfis);
+      tfis.close();
+      if (tloaded instanceof java.util.Map) {
+        java.util.Map troot = (java.util.Map) tloaded;
+        Object mapObj = troot.get("mapping");
+        if (mapObj instanceof java.util.Map) {
+          typeMapping = (java.util.Map) mapObj;
+        }
+        Object rstObj = troot.get("range_boundary_supported_types");
+        if (rstObj instanceof java.util.List) {
+          rangeBoundarySupportedTypes = (java.util.List) rstObj;
+        }
+      }
+    } catch (Exception e) {
+      logError("Could not read type_mapping.yaml at " + typeMappingPath + ": " + e.getMessage());
+    }
+
+    // Set on any setup failure below. "Load via edbldr" reads the
+    // .columns file and issues TRUNCATE against the real target table
+    // as soon as it receives a row - if DDL/catalog setup failed here,
+    // that file may be stale (from a previous successful run) or
+    // missing, and letting rows through would TRUNCATE-and-partially-
+    // load against a table we just failed to (re)validate. So on
+    // failure this table's rows are never forwarded at all, below -
+    // but "Load via edbldr" still runs its own one-time setup
+    // (including edbldr's TRUNCATE) on its very first call regardless
+    // of whether any row ever actually arrives. A marker file, checked
+    // by "Load via edbldr" before it does anything else, is the only
+    // way to tell it to skip entirely. Cleared up front so a marker
+    // from a past failed attempt cannot block a now-successful retry.
+    java.io.File ddlFailedMarker = new java.io.File(
+      edbldrWorkDirTemplate.replace("${PROJECT_HOME}", getVariable("PROJECT_HOME")) + "/" + tableName + ".ddlfailed");
+    ddlFailedMarker.getParentFile().mkdirs();
+    ddlFailedMarker.delete();
+    boolean ddlSetupFailed = false;
+
+    if (srcConnName == null || tgtConnName == null) {
+      logError("Could not resolve config.yaml settings - cannot generate DDL for " + tableName);
+      setErrors(getErrors() + 1);
+      ddlSetupFailed = true;
+    } else {
+      String catalogSql = buildCatalogQuery(srcSchema, tableName);
+
+      java.util.List columnDefs = new java.util.ArrayList();
+      java.util.Map colTypeMap = new java.util.HashMap();
+      java.util.List partitionRows = new java.util.ArrayList();
+      java.util.Map columnComments = new java.util.LinkedHashMap();
+      java.util.List identityColumnNames = new java.util.ArrayList();
+      String tableComment = null;
+
+      try {
+        org.apache.hop.core.database.DatabaseMeta srcDbMeta =
+          (org.apache.hop.core.database.DatabaseMeta) getParent().getMetadataProvider()
+            .getSerializer(org.apache.hop.core.database.DatabaseMeta.class)
+            .load(srcConnName);
+        org.apache.hop.core.database.Database srcDb =
+          new org.apache.hop.core.database.Database(getParent(), getParent(), srcDbMeta);
+        srcDb.connect();
+        try {
+          java.util.List catalogRows = srcDb.getRows(catalogSql, 0);
+          for (int i = 0; i &lt; catalogRows.size(); i++) {
+            Object[] row = (Object[]) catalogRows.get(i);
+            String colName = String.valueOf(row[0]).trim();
+            String dataType = String.valueOf(row[1]).trim().toUpperCase();
+            String lengthStr = (row[2] == null) ? "" : String.valueOf(row[2]).trim();
+            String scaleStr = (row[3] == null) ? "0" : String.valueOf(row[3]).trim();
+            if (scaleStr.length() == 0) {
+              scaleStr = "0";
+            }
+
+            String udtName = null;
+            if (row.length &gt; 5 &amp;&amp; row[5] != null) {
+              udtName = String.valueOf(row[5]).trim();
+            }
+
+            String resolvedType = dataType;
+            if ("DISTINCT".equals(dataType) &amp;&amp; row.length &gt; 6 &amp;&amp; row[6] != null) {
+              resolvedType = String.valueOf(row[6]).trim().toUpperCase();
+            }
+
+            String lookupType = resolvedType;
+            if (row.length &gt; 4 &amp;&amp; row[4] != null) {
+              String ccsidStr = String.valueOf(row[4]).trim();
+              boolean isBitData = "65535".equals(ccsidStr);
+              boolean eligibleForBitData = resolvedType.equals("CHARACTER") || resolvedType.equals("CHAR")
+                || resolvedType.equals("VARCHAR") || resolvedType.equals("GRAPHIC") || resolvedType.equals("VARGRAPHIC");
+              if (isBitData &amp;&amp; eligibleForBitData) {
+                lookupType = resolvedType + "_FOR_BIT_DATA";
+              }
+            }
+
+            String pgType = null;
+            boolean usedOverride = overrides != null &amp;&amp; overrides.containsKey(colName);
+
+            if (usedOverride) {
+              pgType = String.valueOf(overrides.get(colName));
+            } else if (udtName != null &amp;&amp; typeMapping.containsKey(udtName)) {
+              String template = String.valueOf(typeMapping.get(udtName));
+              pgType = template.replace("{length}", lengthStr).replace("{scale}", scaleStr);
+            } else if (typeMapping.containsKey(lookupType)) {
+              String template = String.valueOf(typeMapping.get(lookupType));
+              pgType = template.replace("{length}", lengthStr).replace("{scale}", scaleStr);
+            }
+
+            if (pgType == null) {
+              pgType = "TEXT";
+              logBasic("No mapping found for source type '" + lookupType + "'" + (udtName != null ? " (UDT " + udtName + ")" : "") + " (column " + colName + " in " + tableName + ") - defaulting to TEXT");
+            }
+
+            StringBuilder colDef = new StringBuilder();
+            colDef.append(colName).append(" ").append(pgType);
+
+            // config.yaml's overrides.&lt;table&gt;.&lt;column&gt; is a full manual
+            // escape hatch (a raw column-definition string, e.g. already
+            // including its own NOT NULL) - never append NOT
+            // NULL/DEFAULT/IDENTITY on top of it, that's the user's call.
+            if (!usedOverride) {
+              boolean isIdentity = row.length &gt; 10 &amp;&amp; isYes(row[10]);
+              boolean isNullable = row.length &lt;= 7 || row[7] == null || isYes(row[7]);
+              boolean hasDefault = row.length &gt; 8 &amp;&amp; isYes(row[8]);
+              String columnDefault = row.length &gt; 9 &amp;&amp; row[9] != null ? String.valueOf(row[9]).trim() : null;
+
+              if (isIdentity) {
+                String identityGeneration = row.length &gt; 11 &amp;&amp; row[11] != null ? String.valueOf(row[11]).trim().toUpperCase() : "";
+                String identityStart = row.length &gt; 12 &amp;&amp; row[12] != null ? String.valueOf(row[12]).trim() : "1";
+                String identityIncrement = row.length &gt; 13 &amp;&amp; row[13] != null ? String.valueOf(row[13]).trim() : "1";
+                boolean identityCycle = row.length &gt; 14 &amp;&amp; isYes(row[14]);
+
+                // Always GENERATED BY DEFAULT, never ALWAYS, regardless
+                // of DB2's own IDENTITY_GENERATION: the edbldr bulk load
+                // below (APPEND INTO TABLE, "Load via edbldr") supplies
+                // each row's real historical id explicitly, and Postgres
+                // rejects an explicit value for a GENERATED ALWAYS AS
+                // IDENTITY column unless the loader adds OVERRIDING
+                // SYSTEM VALUE - which edbldr's control file never does.
+                // The sequence is resynced to MAX(id)+1 once the load
+                // finishes (see "Load via edbldr"'s identity-file
+                // handling) so subsequent inserts continue correctly.
+                if ("ALWAYS".equals(identityGeneration)) {
+                  logBasic("Column " + colName + " in " + tableName + " is GENERATED ALWAYS AS IDENTITY in DB2 for i - creating as GENERATED BY DEFAULT in Postgres instead, so the bulk load can supply each row's real id");
+                }
+                colDef.append(" GENERATED BY DEFAULT AS IDENTITY (START WITH ").append(identityStart)
+                  .append(" INCREMENT BY ").append(identityIncrement)
+                  .append(identityCycle ? " CYCLE" : " NO CYCLE").append(")");
+                identityColumnNames.add(colName);
+              } else if (hasDefault &amp;&amp; columnDefault != null &amp;&amp; columnDefault.length() &gt; 0) {
+                // Trusted as-is, the same way buildPartitionQuery's
+                // LOWVALUE/HIGHVALUE literals already are - DB2 for i
+                // returns COLUMN_DEFAULT already formatted for the
+                // column's type (a quoted string, a bare number, a
+                // keyword like CURRENT TIMESTAMP), never re-quote it.
+                colDef.append(" DEFAULT ").append(columnDefault);
+              }
+
+              if (!isNullable) {
+                colDef.append(" NOT NULL");
+              }
+            }
+
+            columnDefs.add(colDef.toString());
+            colTypeMap.put(colName, pgType);
+
+            String generationExpr = row.length &gt; 15 &amp;&amp; row[15] != null ? String.valueOf(row[15]).trim() : null;
+            String columnComment = row.length &gt; 16 &amp;&amp; row[16] != null ? String.valueOf(row[16]).trim() : null;
+            if (generationExpr != null &amp;&amp; generationExpr.length() &gt; 0) {
+              // Not recreated as a real Postgres GENERATED ALWAYS AS
+              // (...) STORED column - Postgres refuses any explicit
+              // value for a stored generated column, which would break
+              // every row of the edbldr bulk load above. Captured as a
+              // COMMENT instead so the source computation isn't lost
+              // silently; recreate it by hand as a generated column if
+              // live recomputation (not just the migrated static
+              // values already copied from DB2) is ever needed.
+              String note = "DB2 for i GENERATED ALWAYS AS (" + generationExpr + ") - migrated as a static copy of the computed values, not a live generated column.";
+              columnComments.put(colName, columnComment != null &amp;&amp; columnComment.length() &gt; 0 ? note + " " + columnComment : note);
+            } else if (columnComment != null &amp;&amp; columnComment.length() &gt; 0) {
+              columnComments.put(colName, columnComment);
+            }
+          }
+
+          try {
+            String tblCommentSql = buildTableCommentQuery(srcSchema, tableName);
+            java.util.List tblCommentRows = srcDb.getRows(tblCommentSql, 0);
+            if (tblCommentRows.size() &gt; 0) {
+              Object[] tcr = (Object[]) tblCommentRows.get(0);
+              if (tcr[0] != null) {
+                String tc = String.valueOf(tcr[0]).trim();
+                if (tc.length() &gt; 0) {
+                  tableComment = tc;
+                }
+              }
+            }
+          } catch (Exception e) {
+            logError("Could not query table comment for " + tableName + ": " + e.getMessage());
+          }
+
+          if (detectPartitions) {
+            String partSql = buildPartitionQuery(srcSchema, tableName);
+            try {
+              partitionRows = srcDb.getRows(partSql, 0);
+            } catch (Exception e) {
+              logError("Could not query partition catalog for " + tableName + ": " + e.getMessage());
+            }
+          }
+        } finally {
+          srcDb.disconnect();
+        }
+      } catch (Exception e) {
+        logError("Could not query source catalog for " + tableName + ": " + e.getMessage());
+        setErrors(getErrors() + 1);
+        ddlSetupFailed = true;
+      }
+
+      if (columnDefs.size() &gt; 0) {
+        // Hop only populates a transform's input row metadata once at
+        // least one row has actually flowed through the pipeline, and
+        // Hop variables set from a UDJC do not propagate to sibling
+        // transforms. So the resolved column list is handed to
+        // "Load via edbldr" via a plain file in the edbldr work
+        // directory instead, which works correctly even when the
+        // source table has zero rows.
+        StringBuffer colNamesCsv = new StringBuffer();
+        for (int i = 0; i &lt; columnDefs.size(); i++) {
+          if (i &gt; 0) {
+            colNamesCsv.append(",");
+          }
+          String fullDef = (String) columnDefs.get(i);
+          colNamesCsv.append(fullDef.split("\\s+")[0]);
+        }
+        String columnsFileWorkDir = edbldrWorkDirTemplate.replace("${PROJECT_HOME}", getVariable("PROJECT_HOME"));
+        try {
+          new java.io.File(columnsFileWorkDir).mkdirs();
+          java.io.FileWriter cfw = new java.io.FileWriter(columnsFileWorkDir + "/" + tableName + ".columns");
+          cfw.write(colNamesCsv.toString());
+          cfw.close();
+        } catch (Exception e) {
+          logError("Could not write column list file for " + tableName + ": " + e.getMessage());
+          setErrors(getErrors() + 1);
+          ddlSetupFailed = true;
+        }
+
+        // Handed to "Load via edbldr" the same way as the .columns file
+        // above, so it can resync each identity column's sequence to
+        // MAX(id)+1 once the bulk load finishes (see GENERATED BY
+        // DEFAULT AS IDENTITY handling above for why the sequence needs
+        // resyncing at all). Deleted when this table has no identity
+        // column (any more), so a stale marker from a prior run/schema
+        // change can't trigger a resync against a column that no longer
+        // exists.
+        java.io.File identityFile = new java.io.File(columnsFileWorkDir + "/" + tableName + ".identity");
+        if (identityColumnNames.size() &gt; 0) {
+          try {
+            StringBuffer idCsv = new StringBuffer();
+            for (int i = 0; i &lt; identityColumnNames.size(); i++) {
+              if (i &gt; 0) {
+                idCsv.append(",");
+              }
+              idCsv.append((String) identityColumnNames.get(i));
+            }
+            java.io.FileWriter ifw = new java.io.FileWriter(identityFile);
+            ifw.write(idCsv.toString());
+            ifw.close();
+          } catch (Exception e) {
+            logError("Could not write identity column list file for " + tableName + ": " + e.getMessage());
+          }
+        } else {
+          identityFile.delete();
+        }
+
+        java.util.List ddlStatements = new java.util.ArrayList();
+        String partitionKeyCol = null;
+        String partitionType = null;
+        boolean buildPartitioned = false;
+
+        if (partitionRows.size() &gt; 0) {
+          Object[] firstPart = (Object[]) partitionRows.get(0);
+          partitionType = String.valueOf(firstPart[1]).trim();
+          String rawKeys = String.valueOf(firstPart[7]).trim();
+          // PARTITIONING_KEYS carries a per-column "NULLS FIRST"/"NULLS
+          // LAST" ordering qualifier inline (e.g. "COL_DATE NULLS LAST"
+          // for a single-column key, confirmed against a real DB2 for i
+          // system) - those tokens are not additional key columns, so
+          // they're filtered out before counting/choosing key columns
+          // (both here and below); otherwise a single-column key with a
+          // NULLS qualifier is misdetected as composite.
+          String[] rawTokens = rawKeys.split("\\s+");
+          java.util.List rawKeyColsList = new java.util.ArrayList();
+          for (int i = 0; i &lt; rawTokens.length; i++) {
+            String tok = rawTokens[i];
+            if (!tok.equalsIgnoreCase("NULLS") &amp;&amp; !tok.equalsIgnoreCase("FIRST") &amp;&amp; !tok.equalsIgnoreCase("LAST")) {
+              rawKeyColsList.add(tok);
+            }
+          }
+          partitionKeyCol = (String) rawKeyColsList.get(0);
+          if (rawKeyColsList.size() &gt; 1) {
+            // Composite (multi-column) partition keys are not supported -
+            // only the first key column is used below, both for the
+            // PARTITION BY clause and for range boundary-type lookup.
+            // Surfaced loudly rather than silently dropping the other
+            // key columns, matching this file's "no tables found"/
+            // "table_select matched none" precedent elsewhere.
+            logBasic("Table " + tableName + " has a composite partition key (" + rawKeys + ") - only '" + partitionKeyCol + "' is used; the other key column(s) are ignored, which may produce a differently-partitioned (though still complete) copy of the data than the source.");
+          }
+
+          if ("R".equals(partitionType)) {
+            String keyPgType = (String) colTypeMap.get(partitionKeyCol);
+
+            String keyBaseType = (keyPgType == null) ? "" : keyPgType.split("[\\s(]")[0].toUpperCase();
+            boolean typeSupported = false;
+            for (int i = 0; i &lt; rangeBoundarySupportedTypes.size(); i++) {
+              if (keyBaseType.equals(String.valueOf(rangeBoundarySupportedTypes.get(i)).toUpperCase())) {
+                typeSupported = true;
+              }
+            }
+
+            if (typeSupported) {
+              buildPartitioned = true;
+            } else {
+              logBasic("Partition key '" + partitionKeyCol + "' of table " + tableName + " has an unsupported type for range boundary conversion (" + keyPgType + ") - creating as a flat table instead");
+            }
+          } else if ("H".equals(partitionType)) {
+            buildPartitioned = true;
+          }
+        }
+
+        if (buildPartitioned &amp;&amp; "R".equals(partitionType)) {
+          StringBuffer parentDdl = new StringBuffer();
+          parentDdl.append("CREATE TABLE IF NOT EXISTS ").append(qq(tgtSchema, tableName)).append(" (");
+          for (int i = 0; i &lt; columnDefs.size(); i++) {
+            if (i &gt; 0) {
+              parentDdl.append(", ");
+            }
+            String fullDef = (String) columnDefs.get(i);
+            int sp = fullDef.indexOf(' ');
+            parentDdl.append(q(fullDef.substring(0, sp))).append(fullDef.substring(sp));
+          }
+          parentDdl.append(") PARTITION BY RANGE (").append(q(partitionKeyCol)).append(")");
+          ddlStatements.add(parentDdl.toString());
+
+          String keyPgType = ((String) colTypeMap.get(partitionKeyCol)).split("[\\s(]")[0].toUpperCase();
+
+          for (int i = 0; i &lt; partitionRows.size(); i++) {
+            Object[] p = (Object[]) partitionRows.get(i);
+            String partName = String.valueOf(p[0]).trim().toLowerCase();
+            Object lowInclusiveObj = p[3];
+            Object lowValObj = p[4];
+            Object highInclusiveObj = p[5];
+            Object highValObj = p[6];
+
+            String fromExpr;
+            if (lowValObj == null) {
+              fromExpr = "MINVALUE";
+            } else {
+              String lowLit = String.valueOf(lowValObj).trim();
+              fromExpr = isInclusive(lowInclusiveObj) ? lowLit : nextValueExpr(lowLit, keyPgType);
+            }
+
+            String toExpr;
+            if (highValObj == null) {
+              toExpr = "MAXVALUE";
+            } else {
+              String highLit = String.valueOf(highValObj).trim();
+              toExpr = isInclusive(highInclusiveObj) ? nextValueExpr(highLit, keyPgType) : highLit;
+            }
+
+            StringBuffer childDdl = new StringBuffer();
+            childDdl.append("CREATE TABLE IF NOT EXISTS ").append(qq(tgtSchema, tableName + "_" + partName))
+              .append(" PARTITION OF ").append(qq(tgtSchema, tableName))
+              .append(" FOR VALUES FROM (").append(fromExpr).append(") TO (").append(toExpr).append(")");
+            ddlStatements.add(childDdl.toString());
+          }
+        } else if (buildPartitioned &amp;&amp; "H".equals(partitionType)) {
+          StringBuffer parentDdl = new StringBuffer();
+          parentDdl.append("CREATE TABLE IF NOT EXISTS ").append(qq(tgtSchema, tableName)).append(" (");
+          for (int i = 0; i &lt; columnDefs.size(); i++) {
+            if (i &gt; 0) {
+              parentDdl.append(", ");
+            }
+            String fullDef = (String) columnDefs.get(i);
+            int sp = fullDef.indexOf(' ');
+            parentDdl.append(q(fullDef.substring(0, sp))).append(fullDef.substring(sp));
+          }
+          parentDdl.append(") PARTITION BY HASH (").append(q(partitionKeyCol)).append(")");
+          ddlStatements.add(parentDdl.toString());
+
+          int modulus = partitionRows.size();
+          for (int i = 0; i &lt; modulus; i++) {
+            StringBuffer childDdl = new StringBuffer();
+            childDdl.append("CREATE TABLE IF NOT EXISTS ").append(qq(tgtSchema, tableName + "_p" + i))
+              .append(" PARTITION OF ").append(qq(tgtSchema, tableName))
+              .append(" FOR VALUES WITH (MODULUS ").append(modulus).append(", REMAINDER ").append(i).append(")");
+            ddlStatements.add(childDdl.toString());
+          }
+        } else {
+          StringBuffer ddl = new StringBuffer();
+          ddl.append("CREATE TABLE IF NOT EXISTS ").append(qq(tgtSchema, tableName)).append(" (");
+          for (int i = 0; i &lt; columnDefs.size(); i++) {
+            if (i &gt; 0) {
+              ddl.append(", ");
+            }
+            String fullDef = (String) columnDefs.get(i);
+            int sp = fullDef.indexOf(' ');
+            ddl.append(q(fullDef.substring(0, sp))).append(fullDef.substring(sp));
+          }
+          ddl.append(")");
+          ddlStatements.add(ddl.toString());
+        }
+
+        if (tableComment != null) {
+          ddlStatements.add("COMMENT ON TABLE " + qq(tgtSchema, tableName) + " IS " + sqlLiteral(tableComment));
+        }
+        java.util.Iterator commentIt = columnComments.keySet().iterator();
+        while (commentIt.hasNext()) {
+          String colName = (String) commentIt.next();
+          String comment = (String) columnComments.get(colName);
+          ddlStatements.add("COMMENT ON COLUMN " + qq(tgtSchema, tableName) + "." + q(colName) + " IS " + sqlLiteral(comment));
+        }
+
+        // "CREATE TABLE IF NOT EXISTS" above is a no-op when this table
+        // already exists (from a previous run), so an explicit TRUNCATE
+        // is what actually guarantees a clean, duplicate-free load on a
+        // retry - this is why the edbldr control file below can safely
+        // use APPEND INTO TABLE (required for PARALLEL loads) instead of
+        // its own TRUNCATE INTO TABLE, which edbldr rejects when
+        // PARALLEL=TRUE ("only APPEND option is supported with PARALLEL
+        // load"). Works for a partitioned parent too - Postgres TRUNCATE
+        // on a partitioned table truncates every partition.
+        ddlStatements.add("TRUNCATE TABLE " + qq(tgtSchema, tableName));
+
+        try {
+          org.apache.hop.core.database.DatabaseMeta tgtDbMeta =
+            (org.apache.hop.core.database.DatabaseMeta) getParent().getMetadataProvider()
+              .getSerializer(org.apache.hop.core.database.DatabaseMeta.class)
+              .load(tgtConnName);
+          org.apache.hop.core.database.Database tgtDb =
+            new org.apache.hop.core.database.Database(getParent(), getParent(), tgtDbMeta);
+          tgtDb.connect();
+          try {
+            boolean anyDdlFailed = false;
+            for (int i = 0; i &lt; ddlStatements.size(); i++) {
+              String stmt = (String) ddlStatements.get(i);
+              try {
+                tgtDb.execStatements(stmt);
+              } catch (Exception e) {
+                logError("Failed to execute DDL for " + tableName + ": " + e.getMessage() + " | DDL: " + stmt);
+                anyDdlFailed = true;
+              }
+            }
+            if (anyDdlFailed) {
+              setErrors(getErrors() + 1);
+              ddlSetupFailed = true;
+            }
+            String partitionNote = buildPartitioned ? (" (partitioned by " + partitionType + " on " + partitionKeyCol + ", " + (ddlStatements.size() - 1) + " partitions)") : "";
+            logBasic("Table (re)created: " + tgtSchema + "." + tableName + " with " + columnDefs.size() + " columns" + partitionNote);
+          } finally {
+            tgtDb.disconnect();
+          }
+        } catch (Exception e) {
+          logError("Failed to create table " + tgtSchema + "." + tableName + ": " + e.getMessage());
+          setErrors(getErrors() + 1);
+          ddlSetupFailed = true;
+        }
+      } else {
+        logError("No column definitions resolved for " + tableName + " - table not created");
+        setErrors(getErrors() + 1);
+        ddlSetupFailed = true;
+      }
+    }
+
+    if (ddlSetupFailed) {
+      logError("Aborting " + tableName + " - not forwarding rows to Load via edbldr (see errors above).");
+      try {
+        java.io.FileWriter mw = new java.io.FileWriter(ddlFailedMarker);
+        mw.write("DDL/catalog setup failed for " + tableName + " - see Generate table DDL's log for this run.\n");
+        mw.close();
+      } catch (Exception e) {
+        logError("Could not write DDL-failure marker for " + tableName + ": " + e.getMessage());
+      }
+      setOutputDone();
+      return false;
+    }
+  }
+
+  if (r == null) {
+    setOutputDone();
+    return false;
+  }
+
+  putRow(getInputRowMeta(), r);
+  return true;
+}
+</class_source>
+      </definition>
+    </definitions>
+    <fields/>
+    <clear_result_fields>N</clear_result_fields>
+    <info_transforms/>
+    <target_transforms/>
+    <usage_parameters/>
+    <attributes/>
+    <GUI>
+      <xloc>48</xloc>
+      <yloc>304</yloc>
+    </GUI>
+  </transform>
+  <order>
+    <hop>
+      <from>ASIS</from>
+      <to>Generate table DDL</to>
+      <enabled>Y</enabled>
+    </hop>
+    <hop>
+      <from>Generate table DDL</from>
+      <to>Load via edbldr</to>
+      <enabled>Y</enabled>
+    </hop>
+  </order>
+  <notepads/>
+  <attributes/>
+  <transform_error_handling/>
+</pipeline>
