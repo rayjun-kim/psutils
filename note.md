@@ -269,32 +269,33 @@ CASE UPPER(TRIM(COALESCE(TYP.SOURCE_TYPE, C.DATA_TYPE))) " +
                 "ELSE TRIM(COALESCE(TYP.SOURCE_TYPE, C.DATA_TYPE)) END
 ```
 
-분류,원본 데이터 타입 (Source),조건 (Condition),변환 데이터 타입 (Target),비고
-문자형,VARCHAR,CCSID = 65535,BYTEA,이진 데이터 처리
-,,그 외,VARCHAR2(LENGTH),
-,CHARACTER / CHAR,CCSID = 65535,BYTEA,이진 데이터 처리
-,,그 외,CHAR(LENGTH),
-,VARGRAPHIC / VARG,-,NVARCHAR2(LENGTH),다국어(유니코드) 가변 문자열
-,GRAPHIC,-,NCHAR(LENGTH),다국어(유니코드) 고정 문자열
-숫자형,SMALLINT,-,SMALLINT,정수
-,INTEGER,-,INTEGER,정수
-,BIGINT,-,BIGINT,정수
-,DECIMAL / NUMERIC,-,"NUMBER(LENGTH, SCALE)",SCALE이 없으면 0 처리
-,DECFLOAT / DECFLOAT16 / DECFLOAT34,-,NUMBER,십진 부동소수점
-,REAL / FLOAT,-,FLOAT,부동소수점
-,DOUBLE,-,DOUBLE PRECISION,배정밀도 부동소수점
-논리형,BOOLEAN,-,BOOLEAN,참/거짓
-날짜/시간형,DATE,-,DATE,날짜
-,TIME,-,TIME,시간
-,TIMESTAMP / TIMESTMP,-,TIMESTAMP,날짜 및 시간
-이진형,BINARY / VARBINARY / VARBIN,-,RAW(LENGTH),바이너리 데이터
-LOB형(대용량),LONG VARCHAR,-,CLOB,대용량 문자 객체
-,LONG VARG / LONG VARGRAPHIC,-,NCLOB,대용량 다국어 문자 객체
-,CLOB,-,CLOB,대용량 문자 객체
-,BLOB,-,BLOB,대용량 이진 객체
-,DBCLOB,-,CLOB,더블바이트 문자 객체
-특수형,XML,-,XMLTYPE,XML 데이터
-,ROWID,-,VARCHAR2(100),행 식별자
-,DATALINK,-,VARCHAR2(255),외부 파일 링크
-사용자 정의형,DISTINCT,-,"""<user_defined_type>""",사용자 정의 타입명을 소문자로 변환 후 큰따옴표로 묶음
-기타,그 외 (ELSE),위 조건에 해당 없음,원본 데이터 타입명 그대로 사용,공백 제거 후 적용
+분류|원본 데이터 타입 (Source)|조건 (Condition)|변환 데이터 타입 (Target)|비고
+-|-|-|-|-
+문자형|VARCHAR|CCSID = 65535|BYTEA|이진 데이터 처리
+||그 외|VARCHAR2(LENGTH)|
+|CHARACTER / CHAR|CCSID = 65535|BYTEA|이진 데이터 처리
+||그 외|CHAR(LENGTH)|
+|VARGRAPHIC / VARG|-|NVARCHAR2(LENGTH)|다국어(유니코드) 가변 문자열
+|GRAPHIC|-|NCHAR(LENGTH)|다국어(유니코드) 고정 문자열
+숫자형|SMALLINT|-|SMALLINT|정수
+|INTEGER|-|INTEGER|정수
+|BIGINT|-|BIGINT|정수
+|DECIMAL / NUMERIC|-|"NUMBER(LENGTH| SCALE)"|SCALE이 없으면 0 처리
+|DECFLOAT / DECFLOAT16 / DECFLOAT34|-|NUMBER|십진 부동소수점
+|REAL / FLOAT|-|FLOAT|부동소수점
+|DOUBLE|-|DOUBLE PRECISION|배정밀도 부동소수점
+논리형|BOOLEAN|-|BOOLEAN|참/거짓
+날짜/시간형|DATE|-|DATE|날짜
+|TIME|-|TIME|시간
+|TIMESTAMP / TIMESTMP|-|TIMESTAMP|날짜 및 시간
+이진형|BINARY / VARBINARY / VARBIN|-|RAW(LENGTH)|바이너리 데이터
+LOB형(대용량)|LONG VARCHAR|-|CLOB|대용량 문자 객체
+|LONG VARG / LONG VARGRAPHIC|-|NCLOB|대용량 다국어 문자 객체
+|CLOB|-|CLOB|대용량 문자 객체
+|BLOB|-|BLOB|대용량 이진 객체
+|DBCLOB|-|CLOB|더블바이트 문자 객체
+특수형|XML|-|XMLTYPE|XML 데이터
+|ROWID|-|VARCHAR2(100)|행 식별자
+|DATALINK|-|VARCHAR2(255)|외부 파일 링크
+사용자 정의형|DISTINCT|-|"""<user_defined_type>"""|사용자 정의 타입명을 소문자로 변환 후 큰따옴표로 묶음
+기타|그 외 (ELSE)|위 조건에 해당 없음|원본 데이터 타입명 그대로 사용|공백 제거 후 적용ㅁ
