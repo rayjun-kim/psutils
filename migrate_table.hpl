@@ -1008,6 +1008,7 @@ public boolean processRow() throws HopException
               }
             }
 
+            logBasic("DEBUG2 " + colName + " => [" + colDef.toString() + "]");
             columnDefs.add(colDef.toString());
             colTypeMap.put(colName, pgType);
 
@@ -1254,6 +1255,7 @@ public boolean processRow() throws HopException
             ddl.append(q(fullDef.substring(0, sp))).append(fullDef.substring(sp));
           }
           ddl.append(")");
+          logBasic("DEBUG3 CREATE TABLE for " + tableName + " => [" + ddl.toString() + "]");
           ddlStatements.add(ddl.toString());
         }
 
