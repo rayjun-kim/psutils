@@ -1,0 +1,88 @@
+# ============================================================
+# DB2 for i -> Postgres type mapping
+# ============================================================
+# Data only (no SQL) - the queries that use this data live in
+# this directory's .hpl files. {length}/{scale} are substituted
+# from the source catalog query at run time. Lookup precedence
+# (see migrate_table.hpl): overrides (config.yaml) > UDT name >
+# resolved type (with _FOR_BIT_DATA suffix where applicable) >
+# TEXT default.
+# ============================================================
+mapping:
+  SMALLINT: INTEGER
+  INTEGER: INTEGER
+  INT: INTEGER
+  BIGINT: BIGINT
+  DECIMAL: "NUMERIC({length},{scale})"
+  DEC: "NUMERIC({length},{scale})"
+  NUMERIC: "NUMERIC({length},{scale})"
+
+  # Mapped to DOUBLE PRECISION rather than NUMERIC: IEEE
+  # floating-point values can exceed any fixed-precision NUMERIC
+  # range at their extremes.
+  REAL: "DOUBLE PRECISION"
+  FLOAT: "DOUBLE PRECISION"
+  DOUBLE: "DOUBLE PRECISION"
+
+  DECFLOAT: TEXT
+
+  CHARACTER: "CHAR({length})"
+  CHAR: "CHAR({length})"
+  VARCHAR: "VARCHAR({length})"
+  CLOB: TEXT
+  GRAPHIC: "CHAR({length})"
+  VARGRAPHIC: "VARCHAR({length})"
+  VARG: "VARCHAR({length})"   # abbreviated catalog form of VARGRAPHIC
+  DBCLOB: TEXT
+
+  DATE: DATE
+  TIME: TIME
+  TIMESTAMP: TIMESTAMP
+  TIMESTMP: TIMESTAMP        # abbreviated catalog form of TIMESTAMP
+
+  BINARY: BYTEA
+  VARBINARY: BYTEA
+  VARBIN: BYTEA               # abbreviated catalog form of VARBINARY
+  BLOB: BYTEA
+
+  # FOR BIT DATA variants (CCSID 65535) of the character types
+  # above - see COL_CCSID note in migrate_table.hpl.
+  CHARACTER_FOR_BIT_DATA: BYTEA
+  CHAR_FOR_BIT_DATA: BYTEA
+  VARCHAR_FOR_BIT_DATA: BYTEA
+  GRAPHIC_FOR_BIT_DATA: BYTEA
+  VARGRAPHIC_FOR_BIT_DATA: BYTEA
+
+  # Mixed/non-single-byte CCSID variants of the character types above
+  # (e.g. Korean 933, Traditional Chinese 937, UTF-16BE 1200, UTF-8
+  # 1208, UCS-2 13488 - see isKnownSingleByteCcsid in migrate_table.hpl)
+  # - DB2's byte-based LENGTH doesn't reliably cap the character count
+  # for these, so they're mapped to unbounded TEXT instead of a fixed
+  # CHAR(n)/VARCHAR(n) to avoid a "value too long" failure at load time
+  # on otherwise perfectly valid text.
+  CHARACTER_MIXED_CCSID: TEXT
+  CHAR_MIXED_CCSID: TEXT
+  VARCHAR_MIXED_CCSID: TEXT
+  GRAPHIC_MIXED_CCSID: TEXT
+  VARGRAPHIC_MIXED_CCSID: TEXT
+
+  ROWID: TEXT
+  XML: XML
+  BOOLEAN: BOOLEAN
+
+  # Example user-defined distinct type mappings. Add one entry
+  # per UDT name to control its target type explicitly; any UDT
+  # not listed here still migrates correctly via its base type.
+  US_DOLLAR: "NUMERIC({length},{scale})"
+  MONEY: "NUMERIC({length},{scale})"
+  EMAIL_ADDR: "VARCHAR({length})"
+  EMAILADDR: "VARCHAR({length})"
+
+# Postgres partitions use an exclusive upper bound (FOR VALUES
+# FROM (x) TO (y), y exclusive), while DB2 for i range partitions
+# report an inclusive upper bound. Converting between the two
+# requires "the value after y", which is only well-defined for
+# a limited set of types. Range partition keys of any other type
+# fall back to an unpartitioned (flat) target table, with a log
+# message.
+range_boundary_supported_types: [DATE, INTEGER]
