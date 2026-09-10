@@ -967,6 +967,7 @@ public boolean processRow() throws HopException
             if (!usedOverride) {
               boolean isIdentity = row.length &gt; 10 &amp;&amp; isYes(row[10]);
               boolean isNullable = row.length &lt;= 7 || row[7] == null || isYes(row[7]);
+              logBasic("DEBUG " + colName + " | row.length=" + row.length + " | row[7]=" + (row.length &gt; 7 ? String.valueOf(row[7]) : "N/A") + " | isNullable=" + isNullable);
               boolean hasDefault = row.length &gt; 8 &amp;&amp; isYes(row[8]);
               String columnDefault = row.length &gt; 9 &amp;&amp; row[9] != null ? String.valueOf(row[9]).trim() : null;
 
