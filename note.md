@@ -299,3 +299,40 @@ LOB형(대용량)|DBCLOB|-|CLOB|더블바이트 문자 객체
 특수형|DATALINK|-|VARCHAR2(255)|외부 파일 링크
 사용자 정의형|DISTINCT|-|"""<user_defined_type>"""|사용자 정의 타입명을 소문자로 변환 후 큰따옴표로 묶음
 기타|그 외 (ELSE)|위 조건에 해당 없음|원본 데이터 타입명 그대로 사용|공백 제거 후 적용
+
+
+
+
+```sql
+WITH table_a AS (
+    SELECT column_name, data_type
+    FROM information_schema.columns
+    WHERE table_schema = 'public' -- 필요시 스키마명 변경
+      AND table_name = '첫번째_테이블명'
+),
+table_b AS (
+    SELECT column_name, data_type
+    FROM information_schema.columns
+    WHERE table_schema = 'public' -- 필요시 스키마명 변경
+      AND table_name = '두번째_테이블명'
+)
+SELECT 
+    COALESCE(a.column_name, b.column_name) AS column_name,
+    a.data_type AS table_a_type,
+    b.data_type AS table_b_type,
+    CASE 
+        WHEN a.column_name IS NULL THEN '테이블A에 컬럼 없음'
+        WHEN b.column_name IS NULL THEN '테이블B에 컬럼 없음'
+        WHEN a.data_type != b.data_type THEN '데이터 타입 불일치'
+        ELSE '완벽 일치'
+    END AS status
+FROM table_a a
+FULL OUTER JOIN table_b b 
+    ON a.column_name = b.column_name
+ORDER BY 
+    CASE 
+        WHEN a.column_name IS NULL OR b.column_name IS NULL OR a.data_type != b.data_type THEN 1 
+        ELSE 2 
+    END, 
+    column_name;
+```
