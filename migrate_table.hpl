@@ -97,6 +97,8 @@ private boolean preflight;
 private String tgtConnName;
 private java.util.List identityColumns;
 private int nulBytesStrippedCount;
+private boolean edbldrStripEmbeddedNewlines;
+private int newlinesStrippedCount;
 
 // Rows are batched into this buffer and flushed to edbldr's stdin every
 // rowBatchSize rows, instead of one write() call per row - measured
@@ -135,6 +137,7 @@ public boolean processRow() throws HopException
     rowBatch = new StringBuffer();
     rowBatchCount = 0;
     nulBytesStrippedCount = 0;
+    newlinesStrippedCount = 0;
     resumeFromCheckpoint = Boolean.parseBoolean(getVariable("RESUME_FROM_CHECKPOINT", "false"));
     statusDbPath = getVariable("STATUS_DB_PATH");
     preflight = Boolean.parseBoolean(getVariable("PREFLIGHT", "false"));
@@ -260,6 +263,8 @@ public boolean processRow() throws HopException
     edbldrHandleConflicts = Boolean.parseBoolean(String.valueOf(tobeCfg.get("edbldr_handle_conflicts")));
     edbldrEmptyCsvField = tobeCfg.get("edbldr_empty_csv_field") == null
       ? "" : String.valueOf(tobeCfg.get("edbldr_empty_csv_field")).trim();
+    edbldrStripEmbeddedNewlines = tobeCfg.get("edbldr_strip_embedded_newlines") == null
+      ? true : Boolean.parseBoolean(String.valueOf(tobeCfg.get("edbldr_strip_embedded_newlines")));
 
     // USERID goes into a parameter file with owner-only permissions
     // instead of on the command line, so it is not visible via ps/
@@ -536,6 +541,9 @@ private boolean finishAndVerify() {
     if (nulBytesStrippedCount &gt; 0) {
       logBasic("Stripped NUL byte(s) (0x00) from " + nulBytesStrippedCount + " cell(s) in " + targetTable + " before loading - Postgres/EPAS cannot store them in text columns; likely legacy padding/binary leftovers in a source CHAR/VARCHAR column not flagged as FOR BIT DATA.");
     }
+    if (newlinesStrippedCount &gt; 0) {
+      logBasic("Replaced embedded newline(s)/carriage return(s) with a space in " + newlinesStrippedCount + " cell(s) in " + targetTable + " before loading - edbldr_strip_embedded_newlines is on (see config.yaml); set it to false to let those rows fail into .bad instead of flattening their line breaks.");
+    }
     resyncIdentitySequences();
     return true;
   }
@@ -628,6 +636,16 @@ private String formatRowAsCsv(org.apache.hop.core.row.IRowMeta rowMeta, Object[]
     if (cell != null &amp;&amp; cell.indexOf('\u0000') &gt;= 0) {
       cell = cell.replace("\u0000", "");
       nulBytesStrippedCount++;
+    }
+
+    // See edbldr_strip_embedded_newlines in config.yaml - unlike the
+    // NUL-byte case above, a newline is real, storable data; this is a
+    // load-reliability trade-off (edbldr's CSV reader has been observed
+    // failing on a legitimately quoted multi-line field), not a strict
+    // correctness fix, so it is toggleable and defaults on.
+    if (edbldrStripEmbeddedNewlines &amp;&amp; cell != null &amp;&amp; (cell.indexOf('\n') &gt;= 0 || cell.indexOf('\r') &gt;= 0)) {
+      cell = cell.replace('\n', ' ').replace('\r', ' ');
+      newlinesStrippedCount++;
     }
 
     boolean isRealValue = (v != null);
