@@ -269,3 +269,26 @@ migration:
   #     SOME_COLUMN: "VARCHAR(4000)"
   # ------------------------------------------------------------
   overrides: {}
+
+  # ------------------------------------------------------------
+  # edb-hop.sh --run --compare
+  # ------------------------------------------------------------
+  # Where the ASIS-vs-TOBE row/column count comparison report is
+  # written (see sources/<active_source>/compare.hpl) - CSV, one row per
+  # table. Only used when --compare is passed; --compare-output on the
+  # command line overrides this. ${PROJECT_HOME} and ${TIMESTAMP}
+  # (yyyyMMdd_HHmmss, the time the compare run started) are substituted.
+  # Leave unset/empty to fall back to the same default this setting
+  # shows here.
+  compare_output: "${PROJECT_HOME}/reports/compare_${TIMESTAMP}.csv"
+
+  # Also SUM/MIN/MAX every numeric column (per sources/<active_source>/
+  # compare.hpl's own definition of "numeric" for that source) and
+  # compare ASIS against TOBE, on top of the row/column counts above -
+  # catches value-level corruption a matching row count alone wouldn't
+  # (e.g. a column silently truncated or mis-mapped). Adds one query per
+  # side per table with at least one numeric column (all of that
+  # table's numeric columns aggregated together, not one query each),
+  # so turn this off for a quicker count-only compare on a schema with
+  # very many/wide tables.
+  compare_numeric_aggregates: true

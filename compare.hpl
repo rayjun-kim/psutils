@@ -1,0 +1,547 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pipeline>
+  <info>
+    <pipeline_version/>
+    <capture_transform_performance>N</capture_transform_performance>
+    <transform_performance_capturing_delay>1000</transform_performance_capturing_delay>
+    <transform_performance_capturing_size_limit>100</transform_performance_capturing_size_limit>
+    <pipeline_type>Normal</pipeline_type>
+    <pipeline_status>0</pipeline_status>
+    <parameters/>
+    <name>compare</name>
+    <name_sync_with_filename>Y</name_sync_with_filename>
+    <description/>
+    <extended_description/>
+    <created_user>-</created_user>
+    <modified_user>-</modified_user>
+    <created_date>2026/09/11 00:00:00.000</created_date>
+    <modified_date>2026/09/11 00:00:00.000</modified_date>
+  </info>
+  <transform>
+    <type>RowGenerator</type>
+    <name>One Row</name>
+    <fields>
+      <field>
+        <name>dummy</name>
+        <type>Integer</type>
+        <length>-1</length>
+        <precision>-1</precision>
+        <string_value>1</string_value>
+        <set_empty_string>N</set_empty_string>
+      </field>
+    </fields>
+    <limit>1</limit>
+    <never_ending>N</never_ending>
+    <start_at_row>0</start_at_row>
+    <interval_in_ms>1000</interval_in_ms>
+    <row_time_field/>
+    <last_time_field/>
+    <distribute>Y</distribute>
+    <copies>1</copies>
+    <GUI>
+      <xloc>48</xloc>
+      <yloc>48</yloc>
+    </GUI>
+    <partitioning>
+      <method>none</method>
+      <schema_name/>
+    </partitioning>
+    <attributes/>
+  </transform>
+  <transform>
+    <name>Compare Tables</name>
+    <type>UserDefinedJavaClass</type>
+    <description/>
+    <distribute>Y</distribute>
+    <custom_distribution/>
+    <copies>1</copies>
+    <partitioning>
+      <method>none</method>
+      <schema_name/>
+    </partitioning>
+    <definitions>
+      <definition>
+        <class_type>TRANSFORM_CLASS</class_type>
+        <class_name>Processor</class_name>
+        <class_source>
+private String csvField(String s) {
+  if (s == null) {
+    return "";
+  }
+  if (s.indexOf(',') &gt;= 0 || s.indexOf('"') &gt;= 0 || s.indexOf('\n') &gt;= 0) {
+    return "\"" + s.replace("\"", "\"\"") + "\"";
+  }
+  return s;
+}
+
+// One row/column count check against a single connection, isolated in
+// its own try/catch so a failure on one side (e.g. the target table was
+// never created) doesn't abort the whole table's comparison - it's
+// recorded as ERROR/"table not found" instead, the same "surface
+// loudly, keep going" precedent as the rest of this project.
+private long scalarCount(org.apache.hop.core.database.Database db, String sql) throws Exception {
+  java.util.List rows = db.getRows(sql, 0);
+  if (rows.size() == 0) {
+    return -1;
+  }
+  Object[] row = (Object[]) rows.get(0);
+  if (row[0] == null) {
+    return 0;
+  }
+  return Long.parseLong(String.valueOf(row[0]).trim());
+}
+
+// DB2 for i DATA_TYPE values that map to a Postgres numeric type in
+// type_mapping.yaml (SMALLINT/INTEGER/INT/BIGINT -> INTEGER/BIGINT,
+// DECIMAL/DEC/NUMERIC -> NUMERIC(length,scale), FLOAT/REAL/DOUBLE ->
+// DOUBLE PRECISION). DECFLOAT is deliberately excluded - type_mapping.yaml
+// maps it to TEXT (see that file's comment), so there's no numeric
+// column on the target side to aggregate against.
+private boolean isNumericType(String dataType) {
+  return "SMALLINT".equals(dataType) || "INTEGER".equals(dataType) || "INT".equals(dataType)
+    || "BIGINT".equals(dataType) || "DECIMAL".equals(dataType) || "DEC".equals(dataType)
+    || "NUMERIC".equals(dataType) || "FLOAT".equals(dataType) || "REAL".equals(dataType)
+    || "DOUBLE".equals(dataType);
+}
+
+private java.util.List getNumericColumns(org.apache.hop.core.database.Database srcDb, String schema, String table) throws Exception {
+  java.util.List cols = new java.util.ArrayList();
+  String sql = "SELECT COLUMN_NAME, DATA_TYPE FROM QSYS2.SYSCOLUMNS WHERE TABLE_SCHEMA = '" + schema + "' AND TABLE_NAME = '" + table + "' ORDER BY ORDINAL_POSITION";
+  java.util.List rows = srcDb.getRows(sql, 0);
+  for (int i = 0; i &lt; rows.size(); i++) {
+    Object[] row = (Object[]) rows.get(i);
+    String colName = String.valueOf(row[0]).trim();
+    String dataType = String.valueOf(row[1]).trim().toUpperCase();
+    if (isNumericType(dataType)) {
+      cols.add(colName);
+    }
+  }
+  return cols;
+}
+
+// One SUM/MIN/MAX per numeric column, all in a single query (not one
+// query per column - a wide table would otherwise mean dozens of round
+// trips per side). quoteLowercase selects DB2-for-i-bare-identifier
+// style (ASIS) vs this project's own lowercase-double-quoted style for
+// whatever it created on the target (TOBE) - see q()/qq() in
+// migrate_table.hpl for the same convention.
+private Object[] fetchAggregates(org.apache.hop.core.database.Database db, String schema, String table, java.util.List columns, boolean quoteLowercase) throws Exception {
+  if (columns.isEmpty()) {
+    return new Object[0];
+  }
+  StringBuilder sql = new StringBuilder("SELECT ");
+  for (int i = 0; i &lt; columns.size(); i++) {
+    if (i &gt; 0) {
+      sql.append(", ");
+    }
+    String col = (String) columns.get(i);
+    String colRef = quoteLowercase ? ("\"" + col.toLowerCase() + "\"") : col;
+    sql.append("SUM(").append(colRef).append("), MIN(").append(colRef).append("), MAX(").append(colRef).append(")");
+  }
+  String tableRef = quoteLowercase
+    ? ("\"" + schema.toLowerCase() + "\".\"" + table.toLowerCase() + "\"")
+    : (schema + "." + table);
+  sql.append(" FROM ").append(tableRef);
+  java.util.List rows = db.getRows(sql.toString(), 0);
+  if (rows.size() == 0) {
+    return new Object[columns.size() * 3];
+  }
+  return (Object[]) rows.get(0);
+}
+
+// Compared as double rather than BigDecimal - simpler, and adequate for
+// a sanity-check tool (a mismatch this misses would have to differ by
+// less than double's ~15-17 significant digits, which is far tighter
+// than any real data-loss bug would produce). Known, accepted
+// limitation: a BIGINT SUM whose true value exceeds 2^53 could lose
+// precision in the comparison itself - not expected to matter in
+// practice, but worth knowing if a report ever looks suspiciously clean
+// on a huge-aggregate column.
+//
+// The 1e-5 relative tolerance is deliberately loose, not just a safety
+// margin: confirmed against a real REAL column ("value too long"'s
+// CCSID discussion applies here too - this is the other DB2-for-i type
+// this tool actually hit an issue with) - DB2 for i's JDBC driver
+// returns a REAL/FLOAT aggregate as the full decimal expansion of the
+// underlying single-precision (float32, ~7 significant digits) binary
+// value (e.g. "-150000000274887790000000000000000000000"), while
+// Postgres's own DOUBLE PRECISION prints the same value compactly
+// ("-1.5E38") - parsing both as double and comparing showed a real,
+// harmless ~1.8e-9 relative difference purely from that string
+// round-tripping, already wider than an actual data-integrity bug would
+// need to slip past a tight tolerance. 1e-5 sits comfortably above
+// float32's own ~1.19e-7 epsilon (with room for a SUM over many rows to
+// accumulate more rounding noise than a single value would) while still
+// catching a genuinely wrong/truncated/corrupted value, which would
+// differ by far more than that.
+private boolean valuesMatch(Object a, Object b) {
+  if (a == null &amp;&amp; b == null) {
+    return true;
+  }
+  if (a == null || b == null) {
+    return false;
+  }
+  try {
+    double da = Double.parseDouble(String.valueOf(a).trim());
+    double db = Double.parseDouble(String.valueOf(b).trim());
+    double diff = Math.abs(da - db);
+    double scale = Math.max(Math.abs(da), Math.abs(db));
+    return diff &lt;= 1e-6 || (scale &gt; 0 &amp;&amp; diff / scale &lt;= 1e-5);
+  } catch (Exception e) {
+    return String.valueOf(a).trim().equals(String.valueOf(b).trim());
+  }
+}
+
+public boolean processRow() throws HopException
+{
+  Object[] r = getRow();
+  if (r == null) {
+    setOutputDone();
+    return false;
+  }
+
+  String configPath = getVariable("PROJECT_HOME") + "/config.yaml";
+  java.util.Map root = null;
+  try {
+    java.io.FileInputStream fis = new java.io.FileInputStream(configPath);
+    org.yaml.snakeyaml.Yaml yaml = new org.yaml.snakeyaml.Yaml();
+    Object loaded = yaml.load(fis);
+    fis.close();
+    if (loaded instanceof java.util.Map) {
+      root = (java.util.Map) loaded;
+    }
+  } catch (Exception e) {
+    logError("Could not read config.yaml: " + e.getMessage());
+  }
+
+  if (root == null) {
+    logError("Could not load config.yaml - aborting compare");
+    setErrors(1);
+    setOutputDone();
+    return false;
+  }
+
+  java.util.Map general = (java.util.Map) root.get("general");
+  java.util.Map migration = (java.util.Map) root.get("migration");
+
+  java.util.Map asisCfg = (java.util.Map) general.get("ASIS");
+  String activeSource = getVariable("ACTIVE_SOURCE");
+  java.util.Map sourceCfg = (java.util.Map) asisCfg.get(activeSource);
+  String srcConnName = String.valueOf(sourceCfg.get("connection"));
+  String srcSchema = String.valueOf(sourceCfg.get("schema"));
+
+  java.util.Map tobeCfg = (java.util.Map) general.get("TOBE");
+  String tgtConnName = String.valueOf(tobeCfg.get("connection"));
+  String tgtSchema = String.valueOf(tobeCfg.get("schema")).toLowerCase();
+
+  // Same table_select/table_exclude semantics as gather_table_info.hpl -
+  // a table deliberately left out of the migration shouldn't be flagged
+  // here as a false "missing in target" finding.
+  java.util.Set tableSelect = new java.util.HashSet();
+  java.util.Set tableExclude = new java.util.HashSet();
+  Object selObj = migration.get("table_select");
+  if (selObj instanceof java.util.List) {
+    java.util.Iterator it = ((java.util.List) selObj).iterator();
+    while (it.hasNext()) tableSelect.add(String.valueOf(it.next()).trim());
+  }
+  Object exclObj = migration.get("table_exclude");
+  if (exclObj instanceof java.util.List) {
+    java.util.Iterator it = ((java.util.List) exclObj).iterator();
+    while (it.hasNext()) tableExclude.add(String.valueOf(it.next()).trim());
+  }
+  boolean tableSelectConfigured = !tableSelect.isEmpty();
+
+  boolean compareNumericAggregates = true;
+  Object aggObj = migration.get("compare_numeric_aggregates");
+  if (aggObj != null) {
+    compareNumericAggregates = Boolean.parseBoolean(String.valueOf(aggObj));
+  }
+
+  // COMPARE_OUTPUT (set by edb-hop.sh --compare-output) wins over
+  // config.yaml's migration.compare_output, which wins over the
+  // built-in default - same override precedence used throughout this
+  // project (e.g. table_select_query over the default extract query).
+  String outputPathTemplate = "${PROJECT_HOME}/reports/compare_${TIMESTAMP}.csv";
+  Object outputObj = migration.get("compare_output");
+  if (outputObj != null &amp;&amp; String.valueOf(outputObj).trim().length() &gt; 0) {
+    outputPathTemplate = String.valueOf(outputObj);
+  }
+  String outputOverride = getVariable("COMPARE_OUTPUT", "");
+  if (outputOverride.length() &gt; 0) {
+    outputPathTemplate = outputOverride;
+  }
+  String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss").format(new java.util.Date());
+  String outputPath = outputPathTemplate
+    .replace("${PROJECT_HOME}", getVariable("PROJECT_HOME"))
+    .replace("${TIMESTAMP}", timestamp);
+
+  java.io.File outputFile = new java.io.File(outputPath);
+  if (outputFile.getParentFile() != null) {
+    outputFile.getParentFile().mkdirs();
+  }
+
+  org.apache.hop.core.database.Database srcDb = null;
+  org.apache.hop.core.database.Database tgtDb = null;
+  java.io.PrintWriter reportWriter = null;
+
+  int totalTables = 0;
+  int rowMatches = 0;
+  int rowMismatches = 0;
+  int rowErrors = 0;
+
+  try {
+    org.apache.hop.core.database.DatabaseMeta srcDbMeta =
+      (org.apache.hop.core.database.DatabaseMeta) getParent().getMetadataProvider()
+        .getSerializer(org.apache.hop.core.database.DatabaseMeta.class)
+        .load(srcConnName);
+    srcDb = new org.apache.hop.core.database.Database(getParent(), getParent(), srcDbMeta);
+    srcDb.connect();
+
+    org.apache.hop.core.database.DatabaseMeta tgtDbMeta =
+      (org.apache.hop.core.database.DatabaseMeta) getParent().getMetadataProvider()
+        .getSerializer(org.apache.hop.core.database.DatabaseMeta.class)
+        .load(tgtConnName);
+    tgtDb = new org.apache.hop.core.database.Database(getParent(), getParent(), tgtDbMeta);
+    tgtDb.connect();
+
+    reportWriter = new java.io.PrintWriter(new java.io.FileWriter(outputFile));
+    reportWriter.println("table_name,asis_row_count,tobe_row_count,row_count_status,asis_column_count,tobe_column_count,column_count_status,numeric_agg_status,notes");
+
+    String tableListSql = "SELECT TABLE_NAME FROM QSYS2.SYSTABLES WHERE TABLE_SCHEMA = '" + srcSchema + "' AND TABLE_TYPE IN ('T', 'P') ORDER BY TABLE_NAME";
+    java.util.List tableRows = srcDb.getRows(tableListSql, 0);
+
+    for (int t = 0; t &lt; tableRows.size(); t++) {
+      Object[] tr = (Object[]) tableRows.get(t);
+      String tableName = String.valueOf(tr[0]).trim();
+
+      if (tableSelectConfigured &amp;&amp; !tableSelect.contains(tableName)) {
+        continue;
+      }
+      if (tableExclude.contains(tableName)) {
+        continue;
+      }
+
+      totalTables++;
+      String tableNameLower = tableName.toLowerCase();
+      String notes = "";
+      long asisRowCount = -1;
+      long tobeRowCount = -1;
+      long asisColCount = -1;
+      long tobeColCount = -1;
+      String rowStatus;
+      String colStatus;
+      String aggStatus = "NONE";
+
+      try {
+        asisRowCount = scalarCount(srcDb, "SELECT COUNT(*) FROM " + srcSchema + "." + tableName);
+      } catch (Exception e) {
+        notes = notes + "ASIS row count failed: " + e.getMessage() + "; ";
+      }
+      try {
+        asisColCount = scalarCount(srcDb, "SELECT COUNT(*) FROM QSYS2.SYSCOLUMNS WHERE TABLE_SCHEMA = '" + srcSchema + "' AND TABLE_NAME = '" + tableName + "'");
+      } catch (Exception e) {
+        notes = notes + "ASIS column count failed: " + e.getMessage() + "; ";
+      }
+
+      boolean tobeExists = false;
+      try {
+        long existsCount = scalarCount(tgtDb, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '" + tgtSchema + "' AND table_name = '" + tableNameLower + "'");
+        tobeExists = existsCount &gt; 0;
+      } catch (Exception e) {
+        notes = notes + "TOBE existence check failed: " + e.getMessage() + "; ";
+      }
+
+      if (!tobeExists) {
+        notes = notes + "Table not found in target (never migrated, or migration failed for it)";
+        rowStatus = "TOBE_MISSING";
+        colStatus = "TOBE_MISSING";
+        aggStatus = "TOBE_MISSING";
+        rowErrors++;
+      } else {
+        try {
+          tobeRowCount = scalarCount(tgtDb, "SELECT COUNT(*) FROM \"" + tgtSchema + "\".\"" + tableNameLower + "\"");
+        } catch (Exception e) {
+          notes = notes + "TOBE row count failed: " + e.getMessage() + "; ";
+        }
+        try {
+          tobeColCount = scalarCount(tgtDb, "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = '" + tgtSchema + "' AND table_name = '" + tableNameLower + "'");
+        } catch (Exception e) {
+          notes = notes + "TOBE column count failed: " + e.getMessage() + "; ";
+        }
+
+        if (asisRowCount &lt; 0 || tobeRowCount &lt; 0) {
+          rowStatus = "ERROR";
+          rowErrors++;
+        } else if (asisRowCount == tobeRowCount) {
+          rowStatus = "MATCH";
+          rowMatches++;
+        } else {
+          rowStatus = "MISMATCH";
+          rowMismatches++;
+        }
+
+        if (asisColCount &lt; 0 || tobeColCount &lt; 0) {
+          colStatus = "ERROR";
+        } else if (asisColCount == tobeColCount) {
+          colStatus = "MATCH";
+        } else {
+          // Not necessarily a bug - GENERATED ALWAYS AS (...) computed
+          // columns and NOT-NULL-backed system CHECK columns don't
+          // change column count, but a source column dropped from
+          // TOBE via table_select_query, or overrides folding two
+          // source columns into one, would show up here too. A
+          // mismatch is a prompt to look, not proof of a defect.
+          colStatus = "MISMATCH";
+        }
+
+        // Distinguish *why* no MATCH/MISMATCH verdict was reached -
+        // "off in config", "nothing to aggregate over" (empty table),
+        // and "no numeric column to begin with" are three different
+        // situations, not one - conflating them into a single generic
+        // label would hide, e.g., a whole run where the feature was
+        // accidentally left disabled.
+        if (!compareNumericAggregates) {
+          aggStatus = "DISABLED";
+        } else if (asisRowCount == 0) {
+          aggStatus = "EMPTY_TABLE";
+        } else {
+          try {
+            java.util.List numericCols = getNumericColumns(srcDb, srcSchema, tableName);
+            if (numericCols.isEmpty()) {
+              aggStatus = "NONE";
+            } else {
+              Object[] asisAgg = fetchAggregates(srcDb, srcSchema, tableName, numericCols, false);
+              Object[] tobeAgg = fetchAggregates(tgtDb, tgtSchema, tableNameLower, numericCols, true);
+              String[] aggNames = {"SUM", "MIN", "MAX"};
+              int aggMismatches = 0;
+              StringBuffer aggNotes = new StringBuffer();
+              for (int i = 0; i &lt; numericCols.size(); i++) {
+                String col = (String) numericCols.get(i);
+                for (int a = 0; a &lt; 3; a++) {
+                  int idx = i * 3 + a;
+                  Object av = idx &lt; asisAgg.length ? asisAgg[idx] : null;
+                  Object tv = idx &lt; tobeAgg.length ? tobeAgg[idx] : null;
+                  if (!valuesMatch(av, tv)) {
+                    aggMismatches++;
+                    if (aggNotes.length() &lt; 300) {
+                      aggNotes.append(col).append(".").append(aggNames[a])
+                        .append("(ASIS=").append(av).append(" TOBE=").append(tv).append(") ");
+                    }
+                  }
+                }
+              }
+              if (aggMismatches == 0) {
+                aggStatus = "MATCH";
+              } else {
+                aggStatus = "MISMATCH";
+                String suffix = aggNotes.length() &gt;= 300 ? "... (truncated)" : "";
+                notes = notes + "Numeric aggregate mismatches (" + aggMismatches + "): " + aggNotes.toString().trim() + suffix;
+              }
+            }
+          } catch (Exception e) {
+            aggStatus = "ERROR";
+            notes = notes + "Numeric aggregate compare failed: " + e.getMessage() + "; ";
+          }
+        }
+      }
+
+      logBasic("Compared " + tableName + ": rows ASIS=" + asisRowCount + " TOBE=" + tobeRowCount + " (" + rowStatus + "), columns ASIS=" + asisColCount + " TOBE=" + tobeColCount + " (" + colStatus + "), numeric aggregates: " + aggStatus);
+
+      StringBuffer line = new StringBuffer();
+      line.append(csvField(tableName)).append(",");
+      line.append(asisRowCount).append(",");
+      line.append(tobeRowCount).append(",");
+      line.append(rowStatus).append(",");
+      line.append(asisColCount).append(",");
+      line.append(tobeColCount).append(",");
+      line.append(colStatus).append(",");
+      line.append(aggStatus).append(",");
+      line.append(csvField(notes.trim()));
+      reportWriter.println(line.toString());
+    }
+  } catch (Exception e) {
+    logError("Compare run failed: " + e.getMessage());
+    setErrors(getErrors() + 1);
+  } finally {
+    if (reportWriter != null) {
+      reportWriter.close();
+    }
+    if (srcDb != null) {
+      srcDb.disconnect();
+    }
+    if (tgtDb != null) {
+      tgtDb.disconnect();
+    }
+  }
+
+  logBasic("Compare finished: " + totalTables + " table(s) checked, " + rowMatches + " row-count match, "
+    + rowMismatches + " row-count mismatch, " + rowErrors + " error/missing. Report: " + outputPath);
+
+  Object[] outputRowData = createOutputRow(r, data.outputRowMeta.size());
+  int outputIndex = getInputRowMeta().size();
+  outputRowData[outputIndex++] = outputPath;
+  outputRowData[outputIndex++] = Long.valueOf(totalTables);
+  outputRowData[outputIndex++] = Long.valueOf(rowMatches);
+  outputRowData[outputIndex++] = Long.valueOf(rowMismatches);
+  outputRowData[outputIndex++] = Long.valueOf(rowErrors);
+  putRow(data.outputRowMeta, outputRowData);
+
+  setOutputDone();
+  return false;
+}
+</class_source>
+      </definition>
+    </definitions>
+    <fields>
+      <field>
+        <field_name>REPORT_PATH</field_name>
+        <field_type>String</field_type>
+        <field_length>-1</field_length>
+        <field_precision>-1</field_precision>
+      </field>
+      <field>
+        <field_name>TABLES_CHECKED</field_name>
+        <field_type>Integer</field_type>
+        <field_length>-1</field_length>
+        <field_precision>-1</field_precision>
+      </field>
+      <field>
+        <field_name>ROW_MATCHES</field_name>
+        <field_type>Integer</field_type>
+        <field_length>-1</field_length>
+        <field_precision>-1</field_precision>
+      </field>
+      <field>
+        <field_name>ROW_MISMATCHES</field_name>
+        <field_type>Integer</field_type>
+        <field_length>-1</field_length>
+        <field_precision>-1</field_precision>
+      </field>
+      <field>
+        <field_name>ROW_ERRORS</field_name>
+        <field_type>Integer</field_type>
+        <field_length>-1</field_length>
+        <field_precision>-1</field_precision>
+      </field>
+    </fields>
+    <clear_result_fields>N</clear_result_fields>
+    <info_transforms/>
+    <target_transforms/>
+    <usage_parameters/>
+    <attributes/>
+    <GUI>
+      <xloc>192</xloc>
+      <yloc>48</yloc>
+    </GUI>
+  </transform>
+  <order>
+    <hop>
+      <from>One Row</from>
+      <to>Compare Tables</to>
+      <enabled>Y</enabled>
+    </hop>
+  </order>
+  <notepads/>
+  <attributes/>
+  <transform_error_handling/>
+</pipeline>

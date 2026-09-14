@@ -1,0 +1,665 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pipeline>
+  <info>
+    <capture_transform_performance>N</capture_transform_performance>
+    <transform_performance_capturing_delay>1000</transform_performance_capturing_delay>
+    <transform_performance_capturing_size_limit>100</transform_performance_capturing_size_limit>
+    <pipeline_type>Normal</pipeline_type>
+    <pipeline_status>-1</pipeline_status>
+    <parameters/>
+    <name>gather_table_info</name>
+    <name_sync_with_filename>Y</name_sync_with_filename>
+    <created_user>-</created_user>
+    <modified_user>-</modified_user>
+    <created_date>2026/08/21 00:00:00.000</created_date>
+    <modified_date>2026/08/21 00:00:00.000</modified_date>
+  </info>
+  <transform>
+    <type>TableInput</type>
+    <name>Get Table List</name>
+    <sql>SELECT TABLE_NAME
+FROM QSYS2.SYSTABLES
+WHERE TABLE_SCHEMA = '${SRC_SCHEMA}'
+  AND TABLE_TYPE IN ('T', 'P')</sql>
+    <limit>0</limit>
+    <execute_each_row>N</execute_each_row>
+    <variables_active>Y</variables_active>
+    <connection>${SRC_CONNECTION}</connection>
+    <lookup/>
+    <sql_from_file/>
+    <distribute>Y</distribute>
+    <copies>1</copies>
+    <GUI>
+      <xloc>192</xloc>
+      <yloc>144</yloc>
+    </GUI>
+    <partitioning>
+      <method>none</method>
+      <schema_name/>
+    </partitioning>
+    <attributes/>
+  </transform>
+  <transform>
+    <name>Filter Already Loaded</name>
+    <type>UserDefinedJavaClass</type>
+    <description/>
+    <distribute>Y</distribute>
+    <custom_distribution/>
+    <copies>1</copies>
+    <partitioning>
+      <method>none</method>
+      <schema_name/>
+    </partitioning>
+    <definitions>
+      <definition>
+        <class_type>TRANSFORM_CLASS</class_type>
+        <class_name>Processor</class_name>
+        <class_source>
+private org.apache.hop.core.database.Database statusDb;
+private java.sql.Connection statusConn;
+private boolean checkpointEnabled;
+private int tablesSeen = 0;
+private int tablesMatchedSelection = 0;
+private java.util.Set tableSelect;
+private java.util.Set tableExclude;
+private java.util.Map tableSelectQuery;
+private boolean tableSelectConfigured;
+private boolean preflight;
+private String preflightLimit;
+private org.apache.hop.core.database.Database srcDbForCatalog;
+private boolean detectPartitions;
+
+// Mirrors migrate_table.hpl's own buildCatalogQuery/buildPartitionQuery/
+// buildTableCommentQuery byte-for-byte - a Hop UserDefinedJavaClass has
+// no way to share code across .hpl files, so this is a deliberate
+// duplication, not drift. Run here (once, serially, before the
+// per-table parallel migrate_table.hpl copies start) and cached into
+// STATUS_DB's catalog_* tables, which migrate_table.hpl's "Generate
+// table DDL" reads instead of opening its own second connection to the
+// source per table - see catalog_columns/catalog_partitions/
+// catalog_table_comment below. This halves the peak concurrent source
+// connections during the parallel phase (was up to 2 x PARALLELISM:
+// this file's own "Get Table List" is a separate, already-serial
+// connection so it isn't part of that count).
+private String buildCatalogQuery(String schema, String table) {
+  StringBuilder sql = new StringBuilder();
+  sql.append("SELECT ");
+  sql.append("C.COLUMN_NAME AS COL_NAME, ");
+  sql.append("C.DATA_TYPE AS DATA_TYPE, ");
+  sql.append("C.LENGTH AS COL_LENGTH, ");
+  sql.append("C.NUMERIC_SCALE AS COL_SCALE, ");
+  sql.append("C.CCSID AS COL_CCSID, ");
+  sql.append("C2.USER_DEFINED_TYPE_NAME AS UDT_NAME, ");
+  sql.append("T.SOURCE_TYPE AS UDT_SOURCE_TYPE, ");
+  sql.append("C2.IS_NULLABLE AS IS_NULLABLE, ");
+  sql.append("C2.HAS_DEFAULT AS HAS_DEFAULT, ");
+  sql.append("C2.COLUMN_DEFAULT AS COLUMN_DEFAULT, ");
+  sql.append("C2.IS_IDENTITY AS IS_IDENTITY, ");
+  sql.append("C2.IDENTITY_GENERATION AS IDENTITY_GENERATION, ");
+  sql.append("C2.IDENTITY_START AS IDENTITY_START, ");
+  sql.append("C2.IDENTITY_INCREMENT AS IDENTITY_INCREMENT, ");
+  sql.append("C2.IDENTITY_CYCLE AS IDENTITY_CYCLE, ");
+  sql.append("C2.COLUMN_EXPRESSION AS COLUMN_EXPRESSION, ");
+  sql.append("COALESCE(C2.LONG_COMMENT, C2.COLUMN_TEXT) AS COLUMN_COMMENT ");
+  sql.append("FROM QSYS2.SYSCOLUMNS C ");
+  sql.append("LEFT JOIN QSYS2.SYSCOLUMNS2 C2 ON C.TABLE_SCHEMA = C2.TABLE_SCHEMA AND C.TABLE_NAME = C2.TABLE_NAME AND C.COLUMN_NAME = C2.COLUMN_NAME ");
+  sql.append("LEFT JOIN QSYS2.SYSTYPES T ON C2.USER_DEFINED_TYPE_SCHEMA = T.USER_DEFINED_TYPE_SCHEMA AND C2.USER_DEFINED_TYPE_NAME = T.USER_DEFINED_TYPE_NAME ");
+  sql.append("WHERE C.TABLE_SCHEMA = '").append(schema).append("' AND C.TABLE_NAME = '").append(table).append("' ");
+  sql.append("ORDER BY C.ORDINAL_POSITION");
+  return sql.toString();
+}
+
+private String buildPartitionQuery(String schema, String table) {
+  StringBuilder sql = new StringBuilder();
+  sql.append("SELECT TABLE_PARTITION, PARTITION_TYPE, PARTITION_NUMBER, ");
+  sql.append("LOWINCLUSIVE, LOWVALUE, HIGHINCLUSIVE, HIGHVALUE, PARTITIONING_KEYS ");
+  sql.append("FROM QSYS2.SYSPARTITIONSTAT ");
+  sql.append("WHERE TABLE_SCHEMA = '").append(schema).append("' AND TABLE_NAME = '").append(table).append("' ");
+  sql.append("ORDER BY PARTITION_NUMBER");
+  return sql.toString();
+}
+
+private String buildTableCommentQuery(String schema, String table) {
+  StringBuilder sql = new StringBuilder();
+  sql.append("SELECT COALESCE(LONG_COMMENT, TABLE_TEXT) AS TABLE_COMMENT ");
+  sql.append("FROM QSYS2.SYSTABLES ");
+  sql.append("WHERE TABLE_SCHEMA = '").append(schema).append("' AND TABLE_NAME = '").append(table).append("'");
+  return sql.toString();
+}
+
+// Fetches this table's catalog metadata from the source (once, here,
+// serially) and refreshes its rows in STATUS_DB's cache tables. Best-
+// effort: a failure here is logged but does not fail the table outright
+// - "Generate table DDL" will simply find no cached rows for it and
+// report "No column definitions resolved", which surfaces the same way
+// a direct catalog-query failure already did before this change.
+private void cacheTableCatalog(String tableName) {
+  if (srcDbForCatalog == null || statusConn == null) {
+    return;
+  }
+  try {
+    java.sql.PreparedStatement delCols = statusConn.prepareStatement("DELETE FROM catalog_columns WHERE table_name=?");
+    delCols.setString(1, tableName);
+    delCols.executeUpdate();
+    delCols.close();
+    java.sql.PreparedStatement delParts = statusConn.prepareStatement("DELETE FROM catalog_partitions WHERE table_name=?");
+    delParts.setString(1, tableName);
+    delParts.executeUpdate();
+    delParts.close();
+    java.sql.PreparedStatement delComment = statusConn.prepareStatement("DELETE FROM catalog_table_comment WHERE table_name=?");
+    delComment.setString(1, tableName);
+    delComment.executeUpdate();
+    delComment.close();
+
+    String srcSchema = getVariable("SRC_SCHEMA");
+
+    java.util.List catalogRows = srcDbForCatalog.getRows(buildCatalogQuery(srcSchema, tableName), 0);
+    java.sql.PreparedStatement insCol = statusConn.prepareStatement(
+      "INSERT INTO catalog_columns (table_name, ordinal_position, col_name, data_type, col_length, col_scale, col_ccsid, udt_name, udt_source_type, is_nullable, has_default, column_default, is_identity, identity_generation, identity_start, identity_increment, identity_cycle, column_expression, column_comment) "
+      + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+    for (int i = 0; i &lt; catalogRows.size(); i++) {
+      Object[] row = (Object[]) catalogRows.get(i);
+      insCol.setString(1, tableName);
+      insCol.setInt(2, i);
+      for (int c = 0; c &lt; 17; c++) {
+        Object val = (c &lt; row.length) ? row[c] : null;
+        insCol.setString(3 + c, val == null ? null : String.valueOf(val));
+      }
+      insCol.addBatch();
+    }
+    insCol.executeBatch();
+    insCol.close();
+
+    if (detectPartitions) {
+      java.util.List partitionRows = srcDbForCatalog.getRows(buildPartitionQuery(srcSchema, tableName), 0);
+      java.sql.PreparedStatement insPart = statusConn.prepareStatement(
+        "INSERT INTO catalog_partitions (table_name, partition_number, partition_name, partition_type, lowinclusive, lowvalue, highinclusive, highvalue, partitioning_keys) "
+        + "VALUES (?,?,?,?,?,?,?,?,?)");
+      for (int i = 0; i &lt; partitionRows.size(); i++) {
+        Object[] p = (Object[]) partitionRows.get(i);
+        insPart.setString(1, tableName);
+        insPart.setInt(2, i);
+        insPart.setString(3, p[0] == null ? null : String.valueOf(p[0]));
+        insPart.setString(4, p[1] == null ? null : String.valueOf(p[1]));
+        insPart.setString(5, p[3] == null ? null : String.valueOf(p[3]));
+        insPart.setString(6, p[4] == null ? null : String.valueOf(p[4]));
+        insPart.setString(7, p[5] == null ? null : String.valueOf(p[5]));
+        insPart.setString(8, p[6] == null ? null : String.valueOf(p[6]));
+        insPart.setString(9, p[7] == null ? null : String.valueOf(p[7]));
+        insPart.addBatch();
+      }
+      insPart.executeBatch();
+      insPart.close();
+    }
+
+    java.util.List tblCommentRows = srcDbForCatalog.getRows(buildTableCommentQuery(srcSchema, tableName), 0);
+    if (tblCommentRows.size() &gt; 0) {
+      Object[] tcr = (Object[]) tblCommentRows.get(0);
+      java.sql.PreparedStatement insComment = statusConn.prepareStatement(
+        "INSERT INTO catalog_table_comment (table_name, table_comment) VALUES (?,?)");
+      insComment.setString(1, tableName);
+      insComment.setString(2, tcr[0] == null ? null : String.valueOf(tcr[0]));
+      insComment.executeUpdate();
+      insComment.close();
+    }
+  } catch (Exception e) {
+    logError("Could not cache catalog metadata for " + tableName + ": " + e.getMessage());
+  }
+}
+
+public boolean processRow() throws HopException
+{
+  Object[] r = getRow();
+
+  if (first) {
+    first = false;
+    checkpointEnabled = Boolean.parseBoolean(getVariable("RESUME_FROM_CHECKPOINT", "false"));
+    // --preflight (see edb-hop.sh --run --help): every table's extraction
+    // query gets a row cap appended below, so a full run's worth of
+    // tables can be smoke-tested (DDL/type-mapping/edbldr load path) in
+    // a fraction of the time/data transfer. Never checked against or
+    // recorded to the checkpoint db (see migrate_table.hpl's
+    // recordLoadStatus) - a preflight table load must never look like a
+    // real completed migration to a later real run, or that run would
+    // skip it and leave only preflightLimit rows behind permanently.
+    preflight = Boolean.parseBoolean(getVariable("PREFLIGHT", "false"));
+    preflightLimit = getVariable("PREFLIGHT_LIMIT", "5");
+
+    // STATUS_DB (SQLite) is now needed unconditionally, not just when
+    // resume_from_checkpoint is on - it's where this table's catalog
+    // metadata gets cached below for migrate_table.hpl to read, instead
+    // of that file opening its own second source connection per table.
+    // The migration_status checkpoint table itself is still only
+    // created by load_config.hpl when resume_from_checkpoint is true;
+    // checkpointEnabled continues to gate the lookups against it below.
+    try {
+      org.apache.hop.core.database.DatabaseMeta statusDbMeta =
+        (org.apache.hop.core.database.DatabaseMeta) getParent().getMetadataProvider()
+          .getSerializer(org.apache.hop.core.database.DatabaseMeta.class)
+          .load("STATUS_DB");
+      statusDb = new org.apache.hop.core.database.Database(getParent(), getParent(), statusDbMeta);
+      statusDb.connect();
+      statusConn = statusDb.getConnection();
+      java.sql.Statement st = statusConn.createStatement();
+      st.execute("PRAGMA busy_timeout=30000");
+      st.execute("CREATE TABLE IF NOT EXISTS catalog_columns ("
+        + "table_name TEXT NOT NULL, ordinal_position INTEGER NOT NULL, "
+        + "col_name TEXT, data_type TEXT, col_length TEXT, col_scale TEXT, col_ccsid TEXT, "
+        + "udt_name TEXT, udt_source_type TEXT, is_nullable TEXT, has_default TEXT, column_default TEXT, "
+        + "is_identity TEXT, identity_generation TEXT, identity_start TEXT, identity_increment TEXT, identity_cycle TEXT, "
+        + "column_expression TEXT, column_comment TEXT, "
+        + "PRIMARY KEY (table_name, ordinal_position))");
+      st.execute("CREATE TABLE IF NOT EXISTS catalog_partitions ("
+        + "table_name TEXT NOT NULL, partition_number INTEGER NOT NULL, partition_name TEXT, partition_type TEXT, "
+        + "lowinclusive TEXT, lowvalue TEXT, highinclusive TEXT, highvalue TEXT, partitioning_keys TEXT, "
+        + "PRIMARY KEY (table_name, partition_number))");
+      st.execute("CREATE TABLE IF NOT EXISTS catalog_table_comment ("
+        + "table_name TEXT PRIMARY KEY, table_comment TEXT)");
+      st.close();
+    } catch (Exception e) {
+      logError("Could not open/initialize catalog cache database: " + e.getMessage() + " - Generate table DDL will find no cached catalog rows and report each table as having none");
+      statusDb = null;
+      statusConn = null;
+      checkpointEnabled = false;
+    }
+
+    try {
+      org.apache.hop.core.database.DatabaseMeta srcDbMeta =
+        (org.apache.hop.core.database.DatabaseMeta) getParent().getMetadataProvider()
+          .getSerializer(org.apache.hop.core.database.DatabaseMeta.class)
+          .load(getVariable("SRC_CONNECTION"));
+      srcDbForCatalog = new org.apache.hop.core.database.Database(getParent(), getParent(), srcDbMeta);
+      srcDbForCatalog.connect();
+    } catch (Exception e) {
+      logError("Could not open source connection for catalog caching: " + e.getMessage());
+      srcDbForCatalog = null;
+    }
+
+    detectPartitions = true;
+
+    // table_select/table_exclude/table_select_query are source-agnostic
+    // options (config.yaml's top-level "migration" block, not per-source),
+    // and lists/maps don't fit cleanly into flat Hop string variables, so
+    // they're read directly here rather than threaded through load_config.hpl.
+    tableSelect = new java.util.HashSet();
+    tableExclude = new java.util.HashSet();
+    tableSelectQuery = new java.util.HashMap();
+    try {
+      String configPath = getVariable("PROJECT_HOME") + "/config.yaml";
+      java.io.FileInputStream fis = new java.io.FileInputStream(configPath);
+      org.yaml.snakeyaml.Yaml yaml = new org.yaml.snakeyaml.Yaml();
+      java.util.Map root = (java.util.Map) yaml.load(fis);
+      fis.close();
+      java.util.Map migrationCfg = (java.util.Map) root.get("migration");
+      if (migrationCfg != null) {
+        Object selObj = migrationCfg.get("table_select");
+        if (selObj instanceof java.util.List) {
+          java.util.Iterator it = ((java.util.List) selObj).iterator();
+          while (it.hasNext()) tableSelect.add(String.valueOf(it.next()).trim());
+        }
+        Object exclObj = migrationCfg.get("table_exclude");
+        if (exclObj instanceof java.util.List) {
+          java.util.Iterator it = ((java.util.List) exclObj).iterator();
+          while (it.hasNext()) tableExclude.add(String.valueOf(it.next()).trim());
+        }
+        Object queryObj = migrationCfg.get("table_select_query");
+        if (queryObj instanceof java.util.Map) {
+          java.util.Map qm = (java.util.Map) queryObj;
+          java.util.Iterator it = qm.keySet().iterator();
+          while (it.hasNext()) {
+            Object k = it.next();
+            tableSelectQuery.put(String.valueOf(k).trim(), String.valueOf(qm.get(k)));
+          }
+        }
+        Object detectPartObj = migrationCfg.get("detect_partitions");
+        if (detectPartObj != null) {
+          detectPartitions = Boolean.parseBoolean(String.valueOf(detectPartObj));
+        }
+      }
+    } catch (Exception e) {
+      logError("Could not read table_select/table_exclude/table_select_query/detect_partitions from config.yaml: " + e.getMessage());
+    }
+    tableSelectConfigured = !tableSelect.isEmpty();
+  }
+
+  if (r == null) {
+    if (statusDb != null) {
+      statusDb.disconnect();
+    }
+    if (srcDbForCatalog != null) {
+      srcDbForCatalog.disconnect();
+    }
+    if (tablesSeen == 0) {
+      // A source query that returns zero tables is almost always a
+      // misconfiguration (wrong/placeholder schema name, wrong
+      // connection, empty source) rather than a legitimate empty
+      // source - left unchecked, the workflow "succeeds" having
+      // migrated nothing, which looks identical to a real success in
+      // the log. Surface it loudly instead of staying silent.
+      logError("No tables found for schema '" + getVariable("SRC_SCHEMA")
+        + "' via connection '" + getVariable("SRC_CONNECTION")
+        + "' - check general.ASIS." + getVariable("ACTIVE_SOURCE")
+        + ".schema in config.yaml (is it still a placeholder like &lt;YOUR_AS400_LIBRARY&gt;?) "
+        + "and that the connection points at the right source.");
+      setErrors(1);
+    } else if (tableSelectConfigured &amp;&amp; tablesMatchedSelection == 0) {
+      // Same idea as the zero-tables check above, but for the case
+      // where the catalog query itself is fine and migration.table_select
+      // in config.yaml just doesn't match anything in it (typo, wrong
+      // case, etc.) - otherwise this silently "succeeds" having migrated
+      // nothing, exactly like the zero-tables case.
+      logError("migration.table_select in config.yaml matched none of the "
+        + tablesSeen + " table(s) found for schema '" + getVariable("SRC_SCHEMA")
+        + "' - check for typos (names must match the source catalog exactly).");
+      setErrors(1);
+    }
+    setOutputDone();
+    return false;
+  }
+
+  tablesSeen++;
+
+  String tableName = String.valueOf(r[0]).trim();
+
+  if (tableSelectConfigured &amp;&amp; !tableSelect.contains(tableName)) {
+    return true;
+  }
+  if (tableExclude.contains(tableName)) {
+    return true;
+  }
+  tablesMatchedSelection++;
+
+  if (checkpointEnabled) {
+    boolean alreadyLoaded = false;
+    try {
+      java.sql.PreparedStatement ps = statusConn.prepareStatement(
+        "SELECT status FROM migration_status WHERE table_name=? AND partition_name='' AND phase='load'");
+      ps.setString(1, tableName);
+      java.sql.ResultSet rs = ps.executeQuery();
+      if (rs.next()) {
+        alreadyLoaded = "SUCCESS".equals(rs.getString(1));
+      }
+      rs.close();
+      ps.close();
+    } catch (Exception e) {
+      logError("Checkpoint lookup failed for " + tableName + ": " + e.getMessage());
+    }
+
+    if (alreadyLoaded) {
+      logBasic("Skipping " + tableName + " - already loaded successfully (checkpoint)");
+      return true;
+    }
+  }
+
+  // This table is actually going to be forwarded to migrate_table.hpl -
+  // refresh its cached catalog metadata now, serially, on this file's
+  // own single source connection, so "Generate table DDL" (running in
+  // parallel, up to PARALLELISM copies) never has to open a second one.
+  cacheTableCatalog(tableName);
+
+  // table_select_query only overrides tables explicitly named in
+  // table_select - by this point tableSelectConfigured==true already
+  // implies tableName is in tableSelect (the earlier check above returns
+  // before this line otherwise), so this just gates on table_select being
+  // active at all: with table_select empty, every table_select_query
+  // entry is ignored and the default extraction query is always used.
+  String extractQuery = (tableSelectConfigured &amp;&amp; tableSelectQuery.containsKey(tableName))
+    ? (String) tableSelectQuery.get(tableName)
+    : "SELECT * FROM " + getVariable("SRC_SCHEMA") + "." + tableName;
+
+  // FETCH FIRST n ROWS ONLY (not LIMIT - the ISO SQL form DB2 for i
+  // supports on any SELECT, default or table_select_query override,
+  // with or without an ORDER BY) caps every table at preflightLimit
+  // rows during --preflight, regardless of which query built it above.
+  if (preflight) {
+    extractQuery = extractQuery + " FETCH FIRST " + preflightLimit + " ROWS ONLY";
+  }
+
+  Object[] outputRowData = createOutputRow(r, data.outputRowMeta.size());
+  int outputIndex = getInputRowMeta().size();
+  outputRowData[outputIndex++] = extractQuery;
+
+  putRow(data.outputRowMeta, outputRowData);
+  return true;
+}
+</class_source>
+      </definition>
+    </definitions>
+    <fields>
+      <field>
+        <field_name>EXTRACT_QUERY</field_name>
+        <field_type>String</field_type>
+        <field_length>-1</field_length>
+        <field_precision>-1</field_precision>
+      </field>
+    </fields>
+    <clear_result_fields>N</clear_result_fields>
+    <info_transforms/>
+    <target_transforms/>
+    <usage_parameters/>
+    <attributes/>
+    <GUI>
+      <xloc>272</xloc>
+      <yloc>144</yloc>
+    </GUI>
+  </transform>
+  <transform>
+    <type>PipelineExecutor</type>
+    <name>Run migrate_table per table</name>
+    <run_configuration>local</run_configuration>
+    <filenameInField>N</filenameInField>
+    <filenameField/>
+    <group_size>1</group_size>
+    <group_field/>
+    <group_time/>
+    <parameters>
+      <variable_mapping>
+        <variable>TABLE_NAME</variable>
+        <field>TABLE_NAME</field>
+        <input/>
+      </variable_mapping>
+      <variable_mapping>
+        <variable>EXTRACT_QUERY</variable>
+        <field>EXTRACT_QUERY</field>
+        <input/>
+      </variable_mapping>
+    </parameters>
+    <inherit_all_vars>Y</inherit_all_vars>
+    <execution_result_target_transform>Check for errors</execution_result_target_transform>
+    <execution_time_field>ExecutionTime</execution_time_field>
+    <execution_result_field>ExecutionResult</execution_result_field>
+    <execution_errors_field>ExecutionNrErrors</execution_errors_field>
+    <execution_lines_read_field>ExecutionLinesRead</execution_lines_read_field>
+    <execution_lines_written_field>ExecutionLinesWritten</execution_lines_written_field>
+    <execution_lines_input_field>ExecutionLinesInput</execution_lines_input_field>
+    <execution_lines_output_field>ExecutionLinesOutput</execution_lines_output_field>
+    <execution_lines_rejected_field>ExecutionLinesRejected</execution_lines_rejected_field>
+    <execution_lines_updated_field>ExecutionLinesUpdated</execution_lines_updated_field>
+    <execution_lines_deleted_field>ExecutionLinesDeleted</execution_lines_deleted_field>
+    <execution_files_retrieved_field>ExecutionFilesRetrieved</execution_files_retrieved_field>
+    <execution_exit_status_field>ExecutionExitStatus</execution_exit_status_field>
+    <execution_log_text_field>ExecutionLogText</execution_log_text_field>
+    <execution_log_channelid_field>ExecutionLogChannelId</execution_log_channelid_field>
+    <result_rows_target_transform/>
+    <result_rows_field>
+      <name/>
+      <type/>
+      <length>-1</length>
+      <precision>-1</precision>
+    </result_rows_field>
+    <result_files_target_transform/>
+    <result_files_file_name_field>FileName</result_files_file_name_field>
+    <executors_output_transform/>
+    <filename>${PROJECT_HOME}/sources/${ACTIVE_SOURCE}/migrate_table.hpl</filename>
+    <distribute>Y</distribute>
+    <copies>${PARALLELISM}</copies>
+    <GUI>
+      <xloc>352</xloc>
+      <yloc>144</yloc>
+    </GUI>
+    <description/>
+    <partitioning>
+      <method>none</method>
+      <schema_name/>
+    </partitioning>
+    <attributes/>
+  </transform>
+  <transform>
+    <name>Check for errors</name>
+    <type>FilterRows</type>
+    <description/>
+    <distribute>Y</distribute>
+    <custom_distribution/>
+    <copies>1</copies>
+    <partitioning>
+      <method>none</method>
+      <schema_name/>
+    </partitioning>
+    <send_true_to>Handle Table Error</send_true_to>
+    <send_false_to>No errors</send_false_to>
+    <compare>
+      <condition>
+        <negated>N</negated>
+        <leftvalue>ExecutionNrErrors</leftvalue>
+        <function>&gt;</function>
+        <rightvalue/>
+        <value>
+          <name>constant</name>
+          <type>Integer</type>
+          <text>0</text>
+          <length>-1</length>
+          <precision>0</precision>
+          <isnull>N</isnull>
+          <mask>####0;-####0</mask>
+        </value>
+      </condition>
+    </compare>
+    <attributes/>
+    <GUI>
+      <xloc>352</xloc>
+      <yloc>288</yloc>
+    </GUI>
+  </transform>
+  <transform>
+    <name>Handle Table Error</name>
+    <type>UserDefinedJavaClass</type>
+    <description/>
+    <distribute>Y</distribute>
+    <custom_distribution/>
+    <copies>1</copies>
+    <partitioning>
+      <method>none</method>
+      <schema_name/>
+    </partitioning>
+    <definitions>
+      <definition>
+        <class_type>TRANSFORM_CLASS</class_type>
+        <class_name>Processor</class_name>
+        <class_source>
+public boolean processRow() throws HopException
+{
+  Object[] r = getRow();
+  if (r == null) {
+    setOutputDone();
+    return false;
+  }
+
+  boolean failFast = Boolean.parseBoolean(getVariable("FAIL_FAST", "true"));
+
+  String tableName = "(unknown)";
+  try {
+    // PipelineExecutor's output row only carries the Execution* result
+    // fields, not the original TABLE_NAME - recover it from the
+    // captured sub-pipeline log text instead (used for logging only).
+    // Only Basic-level messages are guaranteed to be present here, so
+    // match against our own logBasic/logError lines rather than Hop's
+    // internal Detailed-level "SQL query" trace.
+    int logIdx = getInputRowMeta().indexOfValue("ExecutionLogText");
+    if (logIdx &gt;= 0 &amp;&amp; r[logIdx] != null) {
+      String logText = String.valueOf(r[logIdx]);
+      java.util.regex.Matcher m = java.util.regex.Pattern.compile("edbldr failed for (\\S+)").matcher(logText);
+      if (m.find()) {
+        tableName = m.group(1);
+      } else {
+        java.util.regex.Matcher m2 = java.util.regex.Pattern.compile("Table \\(re\\)created: \\S+\\.(\\S+)").matcher(logText);
+        if (m2.find()) {
+          tableName = m2.group(1);
+        }
+      }
+    }
+  } catch (Exception e) {
+    // best effort - only used for the log message below
+  }
+
+  logError("Table " + tableName + " failed in migrate_table.hpl - check the log above for details.");
+  setErrors(getErrors() + 1);
+
+  if (failFast) {
+    throw new HopException("Aborting gather_table_info.hpl: table " + tableName
+      + " failed and fail_fast is true - see config.yaml to change this behavior.");
+  }
+
+  return true;
+}
+</class_source>
+      </definition>
+    </definitions>
+    <fields/>
+    <clear_result_fields>N</clear_result_fields>
+    <info_transforms/>
+    <target_transforms/>
+    <usage_parameters/>
+    <attributes/>
+    <GUI>
+      <xloc>272</xloc>
+      <yloc>384</yloc>
+    </GUI>
+  </transform>
+  <transform>
+    <name>No errors</name>
+    <type>Dummy</type>
+    <description/>
+    <distribute>Y</distribute>
+    <custom_distribution/>
+    <copies>1</copies>
+    <partitioning>
+      <method>none</method>
+      <schema_name/>
+    </partitioning>
+    <attributes/>
+    <GUI>
+      <xloc>432</xloc>
+      <yloc>384</yloc>
+    </GUI>
+  </transform>
+  <order>
+    <hop>
+      <from>Get Table List</from>
+      <to>Filter Already Loaded</to>
+      <enabled>Y</enabled>
+    </hop>
+    <hop>
+      <from>Filter Already Loaded</from>
+      <to>Run migrate_table per table</to>
+      <enabled>Y</enabled>
+    </hop>
+    <hop>
+      <from>Run migrate_table per table</from>
+      <to>Check for errors</to>
+      <enabled>Y</enabled>
+    </hop>
+    <hop>
+      <from>Check for errors</from>
+      <to>Handle Table Error</to>
+      <enabled>Y</enabled>
+    </hop>
+    <hop>
+      <from>Check for errors</from>
+      <to>No errors</to>
+      <enabled>Y</enabled>
+    </hop>
+  </order>
+  <notepads/>
+  <attributes/>
+  <transform_error_handling/>
+</pipeline>

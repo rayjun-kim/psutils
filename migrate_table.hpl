@@ -684,62 +684,30 @@ private String qq(String schema, String name) {
   return "\"" + schema.toLowerCase() + "\".\"" + name.toLowerCase() + "\"";
 }
 
-// DB2 for i column/type catalog query, composed rather than a single
-// static string (mirrors psql describe.c's approach of assembling a
-// query from pieces). {schema}/{table} are substituted here since this
-// file is already DB2-for-i-specific - no source-type branching needed.
-//
-// COL_CCSID: on DB2 for i, CCSID 65535 marks a "FOR BIT DATA" column -
-// it is catalogued as CHARACTER/VARCHAR/etc. but the actual values are
-// binary. UDT_NAME/UDT_SOURCE_TYPE resolve user-defined distinct types
-// (DB2 for i reports a UDT column's DATA_TYPE as simply "DISTINCT").
-//
-// The rest (from SYSCOLUMNS2, IBM's documented source for these) drive
-// nullability/DEFAULT/IDENTITY/computed-column/comment handling below:
-// IS_NULLABLE, HAS_DEFAULT/COLUMN_DEFAULT, IS_IDENTITY and its
-// IDENTITY_* generation settings, COLUMN_EXPRESSION (generated/computed
-// columns), and COALESCE(LONG_COMMENT, COLUMN_TEXT) (the COMMENT-
-// statement text, falling back to the shorter LABEL-statement text).
-private String buildCatalogQuery(String schema, String table) {
-  StringBuilder sql = new StringBuilder();
-  sql.append("SELECT ");
-  sql.append("C.COLUMN_NAME AS COL_NAME, ");
-  sql.append("C.DATA_TYPE AS DATA_TYPE, ");
-  sql.append("C.LENGTH AS COL_LENGTH, ");
-  sql.append("C.NUMERIC_SCALE AS COL_SCALE, ");
-  sql.append("C.CCSID AS COL_CCSID, ");
-  sql.append("C2.USER_DEFINED_TYPE_NAME AS UDT_NAME, ");
-  sql.append("T.SOURCE_TYPE AS UDT_SOURCE_TYPE, ");
-  sql.append("C2.IS_NULLABLE AS IS_NULLABLE, ");
-  sql.append("C2.HAS_DEFAULT AS HAS_DEFAULT, ");
-  sql.append("C2.COLUMN_DEFAULT AS COLUMN_DEFAULT, ");
-  sql.append("C2.IS_IDENTITY AS IS_IDENTITY, ");
-  sql.append("C2.IDENTITY_GENERATION AS IDENTITY_GENERATION, ");
-  sql.append("C2.IDENTITY_START AS IDENTITY_START, ");
-  sql.append("C2.IDENTITY_INCREMENT AS IDENTITY_INCREMENT, ");
-  sql.append("C2.IDENTITY_CYCLE AS IDENTITY_CYCLE, ");
-  sql.append("C2.COLUMN_EXPRESSION AS COLUMN_EXPRESSION, ");
-  sql.append("COALESCE(C2.LONG_COMMENT, C2.COLUMN_TEXT) AS COLUMN_COMMENT ");
-  sql.append("FROM QSYS2.SYSCOLUMNS C ");
-  sql.append("LEFT JOIN QSYS2.SYSCOLUMNS2 C2 ON C.TABLE_SCHEMA = C2.TABLE_SCHEMA AND C.TABLE_NAME = C2.TABLE_NAME AND C.COLUMN_NAME = C2.COLUMN_NAME ");
-  sql.append("LEFT JOIN QSYS2.SYSTYPES T ON C2.USER_DEFINED_TYPE_SCHEMA = T.USER_DEFINED_TYPE_SCHEMA AND C2.USER_DEFINED_TYPE_NAME = T.USER_DEFINED_TYPE_NAME ");
-  sql.append("WHERE C.TABLE_SCHEMA = '").append(schema).append("' AND C.TABLE_NAME = '").append(table).append("' ");
-  // Without this, column order is whatever QSYS2.SYSCOLUMNS happens to
-  // return, which is not guaranteed to match SELECT *'s column order -
-  // the .ctl file (built from this query's order) and the actual CSV
-  // data (built from SELECT *'s order) would then silently disagree.
-  sql.append("ORDER BY C.ORDINAL_POSITION");
-  return sql.toString();
-}
-
-// Table-level COMMENT/LABEL text - queried once per table, separately
-// from the per-column catalog query above.
-private String buildTableCommentQuery(String schema, String table) {
-  StringBuilder sql = new StringBuilder();
-  sql.append("SELECT COALESCE(LONG_COMMENT, TABLE_TEXT) AS TABLE_COMMENT ");
-  sql.append("FROM QSYS2.SYSTABLES ");
-  sql.append("WHERE TABLE_SCHEMA = '").append(schema).append("' AND TABLE_NAME = '").append(table).append("'");
-  return sql.toString();
+// This table's catalog metadata (columns, partitions, table comment) is
+// no longer queried directly from the source here - gather_table_info.hpl
+// already fetched it (once, serially, before the parallel per-table
+// copies of this file even start) and cached it into STATUS_DB's
+// catalog_* tables; see that file's buildCatalogQuery/buildPartitionQuery/
+// buildTableCommentQuery/cacheTableCatalog for the source-side queries
+// and exact column order these SQLite tables mirror, and queryCache
+// below for how this file reads them back.
+private java.util.List queryCache(java.sql.Connection conn, String sql, String tableName) throws Exception {
+  java.util.List rows = new java.util.ArrayList();
+  java.sql.PreparedStatement ps = conn.prepareStatement(sql);
+  ps.setString(1, tableName);
+  java.sql.ResultSet rs = ps.executeQuery();
+  int colCount = rs.getMetaData().getColumnCount();
+  while (rs.next()) {
+    Object[] row = new Object[colCount];
+    for (int c = 0; c &lt; colCount; c++) {
+      row[c] = rs.getObject(c + 1);
+    }
+    rows.add(row);
+  }
+  rs.close();
+  ps.close();
+  return rows;
 }
 
 // SYSCOLUMNS2's YES/NO-style flag columns (IS_NULLABLE, HAS_DEFAULT,
@@ -778,21 +746,6 @@ private String sqlLiteral(String s) {
 // happens to everything else.
 private boolean isKnownSingleByteCcsid(String ccsidStr) {
   return "37".equals(ccsidStr) || "500".equals(ccsidStr) || "1025".equals(ccsidStr) || "28709".equals(ccsidStr);
-}
-
-// Partition catalog query. PARTITION_TYPE is 'R' (range) or 'H' (hash).
-// LOWVALUE/HIGHVALUE come back from DB2 for i already formatted as a
-// literal usable directly in SQL for the column's type (e.g. a DATE
-// boundary is returned as the quoted string "'2025-01-31'", not a bare
-// date) - never re-quote them.
-private String buildPartitionQuery(String schema, String table) {
-  StringBuilder sql = new StringBuilder();
-  sql.append("SELECT TABLE_PARTITION, PARTITION_TYPE, PARTITION_NUMBER, ");
-  sql.append("LOWINCLUSIVE, LOWVALUE, HIGHINCLUSIVE, HIGHVALUE, PARTITIONING_KEYS ");
-  sql.append("FROM QSYS2.SYSPARTITIONSTAT ");
-  sql.append("WHERE TABLE_SCHEMA = '").append(schema).append("' AND TABLE_NAME = '").append(table).append("' ");
-  sql.append("ORDER BY PARTITION_NUMBER");
-  return sql.toString();
 }
 
 // Postgres declarative range partitioning is always FOR VALUES FROM (x)
@@ -931,8 +884,6 @@ public boolean processRow() throws HopException
       setErrors(getErrors() + 1);
       ddlSetupFailed = true;
     } else {
-      String catalogSql = buildCatalogQuery(srcSchema, tableName);
-
       java.util.List columnDefs = new java.util.ArrayList();
       java.util.Map colTypeMap = new java.util.HashMap();
       java.util.List partitionRows = new java.util.ArrayList();
@@ -940,16 +891,33 @@ public boolean processRow() throws HopException
       java.util.List identityColumnNames = new java.util.ArrayList();
       String tableComment = null;
 
+      // Reads the catalog metadata gather_table_info.hpl already fetched
+      // from the source (once, serially) and cached into STATUS_DB's
+      // catalog_* tables (see that file's cacheTableCatalog) - this
+      // transform used to open its own second source connection here
+      // and query QSYS2 directly; doing that once per table x
+      // PARALLELISM copies is exactly what was exhausting the source's
+      // concurrent-connection limit. Reading a local SQLite cache
+      // instead needs no source connection at all.
       try {
-        org.apache.hop.core.database.DatabaseMeta srcDbMeta =
+        org.apache.hop.core.database.DatabaseMeta statusDbMeta =
           (org.apache.hop.core.database.DatabaseMeta) getParent().getMetadataProvider()
             .getSerializer(org.apache.hop.core.database.DatabaseMeta.class)
-            .load(srcConnName);
-        org.apache.hop.core.database.Database srcDb =
-          new org.apache.hop.core.database.Database(getParent(), getParent(), srcDbMeta);
-        srcDb.connect();
+            .load("STATUS_DB");
+        org.apache.hop.core.database.Database cacheDb =
+          new org.apache.hop.core.database.Database(getParent(), getParent(), statusDbMeta);
+        cacheDb.connect();
         try {
-          java.util.List catalogRows = srcDb.getRows(catalogSql, 0);
+          java.sql.Connection cacheConn = cacheDb.getConnection();
+          java.sql.Statement pragma = cacheConn.createStatement();
+          pragma.execute("PRAGMA busy_timeout=30000");
+          pragma.close();
+
+          java.util.List catalogRows = queryCache(cacheConn,
+            "SELECT col_name, data_type, col_length, col_scale, col_ccsid, udt_name, udt_source_type, "
+            + "is_nullable, has_default, column_default, is_identity, identity_generation, identity_start, "
+            + "identity_increment, identity_cycle, column_expression, column_comment "
+            + "FROM catalog_columns WHERE table_name = ? ORDER BY ordinal_position", tableName);
           for (int i = 0; i &lt; catalogRows.size(); i++) {
             Object[] row = (Object[]) catalogRows.get(i);
             String colName = String.valueOf(row[0]).trim();
@@ -1090,8 +1058,8 @@ public boolean processRow() throws HopException
           }
 
           try {
-            String tblCommentSql = buildTableCommentQuery(srcSchema, tableName);
-            java.util.List tblCommentRows = srcDb.getRows(tblCommentSql, 0);
+            java.util.List tblCommentRows = queryCache(cacheConn,
+              "SELECT table_comment FROM catalog_table_comment WHERE table_name = ?", tableName);
             if (tblCommentRows.size() &gt; 0) {
               Object[] tcr = (Object[]) tblCommentRows.get(0);
               if (tcr[0] != null) {
@@ -1102,22 +1070,23 @@ public boolean processRow() throws HopException
               }
             }
           } catch (Exception e) {
-            logError("Could not query table comment for " + tableName + ": " + e.getMessage());
+            logError("Could not read cached table comment for " + tableName + ": " + e.getMessage());
           }
 
           if (detectPartitions) {
-            String partSql = buildPartitionQuery(srcSchema, tableName);
             try {
-              partitionRows = srcDb.getRows(partSql, 0);
+              partitionRows = queryCache(cacheConn,
+                "SELECT partition_name, partition_type, partition_number, lowinclusive, lowvalue, highinclusive, highvalue, partitioning_keys "
+                + "FROM catalog_partitions WHERE table_name = ? ORDER BY partition_number", tableName);
             } catch (Exception e) {
-              logError("Could not query partition catalog for " + tableName + ": " + e.getMessage());
+              logError("Could not read cached partition catalog for " + tableName + ": " + e.getMessage());
             }
           }
         } finally {
-          srcDb.disconnect();
+          cacheDb.disconnect();
         }
       } catch (Exception e) {
-        logError("Could not query source catalog for " + tableName + ": " + e.getMessage());
+        logError("Could not read cached catalog for " + tableName + ": " + e.getMessage());
         setErrors(getErrors() + 1);
         ddlSetupFailed = true;
       }
