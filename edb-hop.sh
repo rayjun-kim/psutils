@@ -4,16 +4,24 @@
 #
 # Expects to be run from the directory it was extracted into, alongside
 # a "files/" subdirectory holding:
-#   files/edb-hop-v1.2.tar.gz          - the project's pipelines/config template
+#   files/edb-hop.tar.gz                - the project's pipelines/config template
 #   files/apache-hop-client-2.19.0.zip - the Apache Hop CLI client
 #   files/java-21-openjdk.zip          - a JDK the client can run on
 #
 #   edb-mig-hop/
 #     edb-hop.sh
 #     files/
-#       edb-hop-v1.2.tar.gz
+#       edb-hop.tar.gz
 #       apache-hop-client-2.19.0.zip
 #       java-21-openjdk.zip
+#
+# edb-hop.tar.gz is deliberately unversioned in its filename (unlike the
+# Hop client/JDK, which are external dependencies with real, distinct
+# releases that must match exactly): it's always built from this same
+# repo's edb-hop/ by this same repo's build.sh in one atomic step, so
+# it and edb-hop.sh never drift apart the way an external dependency
+# could - there's nothing for a version number in the filename to
+# protect against, only a manual bump someone would inevitably forget.
 #
 # --install extracts the Hop client to ./hop, then the bundled JDK to
 # ./hop/java-bundle (kept inside hop/ rather than alongside it, since
@@ -42,7 +50,7 @@ FILES_DIR="$INSTALL_DIR/files"
 PROJECT_NAME="edb-hop"
 
 HOP_ARCHIVE="$FILES_DIR/apache-hop-client-2.19.0.zip"
-EDB_HOP_ARCHIVE="$FILES_DIR/edb-hop-v1.2.tar.gz"
+EDB_HOP_ARCHIVE="$FILES_DIR/edb-hop.tar.gz"
 JAVA_ARCHIVE="$FILES_DIR/java-21-openjdk.zip"
 
 # ------------------------------------------------------------------
@@ -66,6 +74,13 @@ Commands:
                               runs docker itself).
   --run --docker ...         Start a container from an image already
                               built from that Dockerfile.
+
+--project NAME (on --install/--config/--run, non-docker): operate on a
+Hop project named NAME instead of the default "edb-hop", so one Java +
+Apache Hop install can migrate several schemas independently - each
+--project gets its own config.yaml/ASIS.json/TOBE.json/checkpoint db
+under hop/config/projects/NAME/, registered alongside (not replacing)
+the default project. See 'edb-hop.sh --install --help' for details.
 
 Run 'edb-hop.sh <command> --help' for command-specific options, and
 'edb-hop.sh <command> --docker --help' for the docker-mode options.
@@ -254,6 +269,20 @@ read_source_jvm_opts() {
   tr '\n' ' ' < "$opts_file"
 }
 
+# Prints config.yaml's general.hop_heap_size (there is only one
+# "hop_heap_size:" line in the file, so a plain per-line match is enough).
+# Falls back to "2g" - Apache Hop's own built-in hop-run.sh default -
+# if the file or key is missing, so an old config.yaml from before this
+# setting existed still behaves exactly as it did before.
+read_hop_heap_size() {
+  local config_yaml="$1"
+  local value=""
+  if [ -f "$config_yaml" ]; then
+    value=$(sed -n 's/^[[:space:]]*hop_heap_size:[[:space:]]*//p' "$config_yaml" | head -n1)
+  fi
+  echo "${value:-2g}"
+}
+
 # ------------------------------------------------------------------
 # --install
 # ------------------------------------------------------------------
@@ -264,25 +293,31 @@ cmd_install() {
 
   # --docker switches this into an entirely different mode (generate a
   # Dockerfile, no local Java/Hop install) - peek for it up front.
-  local a
+  local a prev=""
   for a in "$@"; do
     if [ "$a" = "--docker" ]; then
       cmd_install_docker "$@"
       return
     fi
+    [ "$prev" = "--project" ] && PROJECT_NAME="$a"
+    prev="$a"
   done
 
   local force=0
   local use_system_java=0
   local java_home_arg=""
+  local reuse_conninfo_from=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --force) force=1; shift ;;
       --use-system-java) use_system_java=1; shift ;;
       --java-home) java_home_arg="$2"; shift 2 ;;
+      --project) shift 2 ;;  # already applied to PROJECT_NAME above
+      --reuse-conninfo) reuse_conninfo_from="$2"; shift 2 ;;
       -h|--help)
         cat <<'EOF'
 Usage: edb-hop.sh --install [--force] [--use-system-java | --java-home PATH]
+                   [--project NAME] [--reuse-conninfo default|OTHER_NAME]
 
 Extracts Java, Apache Hop, and the edb-hop project into this directory
 and registers the "edb-hop" project with Hop. Safe to re-run: already
@@ -290,6 +325,39 @@ extracted archives are left alone, and an already-configured
 config.yaml / ASIS.json / TOBE.json is preserved across upgrades
 unless --force is given (which resets them back to the shipped
 template - use this only if you want to start configuration over).
+
+  --project NAME       Register a second (third, ...) Hop project named
+                       NAME alongside the default "edb-hop" one, sharing
+                       this same Java + Apache Hop client install (never
+                       re-extracted just because --project differs) but
+                       with its own config.yaml/ASIS.json/TOBE.json and
+                       checkpoint db under hop/config/projects/NAME/ -
+                       for migrating a second schema independently
+                       (own connection info, own progress tracking,
+                       own edbldr_work/ dir) without a second full
+                       install. Pass the same --project to --config and
+                       --run to address it; omit everywhere to keep
+                       using the default "edb-hop" project as before.
+  --reuse-conninfo default|OTHER_NAME
+                       Copy ASIS/TOBE host, port, database name,
+                       user, and password (and edbldr_path) from
+                       another already-configured project - "default"
+                       means the "edb-hop" project, or name any other
+                       --project. Only connection info is copied, never
+                       the schema/library fields (ASIS's config.yaml
+                       schema: line, TOBE's schema: line) - those stay
+                       whatever this project's template/previous value
+                       was, since the whole point of a second project
+                       is migrating a *different* schema through the
+                       *same* connection. Run this, then just
+                       './edb-hop.sh --config --project NAME
+                       --asis-schema X --tobe-schema Y' to finish
+                       setting it up. Applies even on a re-install
+                       without --force (it intentionally overrides
+                       whatever connection info that project already
+                       had, since asking for it is the point) - the
+                       source project must already exist and have
+                       ASIS.json/TOBE.json in place.
 
 By default, --install bundles and always uses its own JDK under
 hop/java-bundle, to guarantee an exact known-good Java regardless of
@@ -461,6 +529,35 @@ EOF
   trap - EXIT
   echo "  deployed to $project_dir"
 
+  if [ -n "$reuse_conninfo_from" ]; then
+    local source_name="$reuse_conninfo_from"
+    [ "$source_name" = "default" ] && source_name="edb-hop"
+    local source_dir="$hop_home/config/projects/$source_name"
+    local source_asis="$source_dir/metadata/rdbms/ASIS.json"
+    local source_tobe="$source_dir/metadata/rdbms/TOBE.json"
+    local source_cfg="$source_dir/config.yaml"
+    if [ ! -f "$source_asis" ] || [ ! -f "$source_tobe" ]; then
+      echo "ERROR: --reuse-conninfo '$reuse_conninfo_from' (project '$source_name') has no ASIS.json/TOBE.json - install/configure it first." >&2
+      exit 1
+    fi
+    echo "== Reusing connection info from project '$source_name' =="
+    local field
+    for field in hostname port databaseName username password; do
+      set_json_field "$project_dir/metadata/rdbms/ASIS.json" "$field" "$(get_json_field "$source_asis" "$field")"
+      set_json_field "$project_dir/metadata/rdbms/TOBE.json" "$field" "$(get_json_field "$source_tobe" "$field")"
+    done
+    local source_edbldr_path
+    source_edbldr_path=$(sed -n 's/^[[:space:]]*edbldr_path:[[:space:]]*//p' "$source_cfg" | head -n1)
+    if [ -n "$source_edbldr_path" ]; then
+      local esc
+      esc=$(printf '%s' "$source_edbldr_path" | sed -e 's/[&/\]/\\&/g')
+      sed -i "s|^\(\s*\)edbldr_path:.*|\1edbldr_path: ${esc}|" "$project_dir/config.yaml"
+    fi
+    echo "  copied ASIS/TOBE host, port, database, user, password, and edbldr_path"
+    echo "  schema/library fields left as-is - set them with:"
+    echo "  ./edb-hop.sh --config --project $PROJECT_NAME --asis-schema X --tobe-schema Y"
+  fi
+
   echo "== Registering project '$PROJECT_NAME' =="
   (
     cd "$hop_home"
@@ -471,10 +568,12 @@ EOF
     fi
   )
 
+  local proj_flag=""
+  [ "$PROJECT_NAME" != "edb-hop" ] && proj_flag=" --project $PROJECT_NAME"
   echo ""
   echo "Install complete."
-  echo "Next: ./edb-hop.sh --config ...   (set up ASIS/TOBE connection info)"
-  echo "Then: ./edb-hop.sh --run"
+  echo "Next: ./edb-hop.sh --config${proj_flag} ...   (set up ASIS/TOBE connection info)"
+  echo "Then: ./edb-hop.sh --run${proj_flag}"
 }
 
 # ------------------------------------------------------------------
@@ -537,22 +636,36 @@ EOF
   fi
   [ -f "$EDB_HOP_ARCHIVE" ] || { echo "ERROR: $EDB_HOP_ARCHIVE not found." >&2; return 1; }
 
-  # Bake in whatever JVM flags the shipped project's active source
-  # connector needs (sources/<active_source>/jvm-opts, if it ships one) -
-  # same mechanism cmd_run uses, so this stays source-agnostic instead of
-  # hardcoding one connector's driver quirks into every generated image.
-  local peek_active_source peek_jvm_opts jvm_opts_env_block=""
-  peek_active_source=$(tar -xzO -f "$EDB_HOP_ARCHIVE" edb-hop/config.yaml 2>/dev/null \
-    | sed -n 's/^[[:space:]]*active_source:[[:space:]]*//p' | head -n1)
-  if [ -n "$peek_active_source" ]; then
-    peek_jvm_opts=$(tar -xzO -f "$EDB_HOP_ARCHIVE" "edb-hop/sources/$peek_active_source/jvm-opts" 2>/dev/null | tr '\n' ' ')
-    if [ -n "$peek_jvm_opts" ]; then
+  # Bake in the JVM flags every implemented source connector's driver
+  # needs (every sources/*/jvm-opts the archive has), not just whichever
+  # one config.yaml's active_source happens to be right now: this image
+  # is meant to be usable as a Hop web UI, where active_source can be
+  # switched afterward (editing config.yaml in the running container)
+  # without rebuilding the image - baking in only the build-time-active
+  # connector's flags would silently leave a later-switched-to
+  # connector's own driver quirk unset. Harmless to include a flag for a
+  # connector nobody ends up using; leaving one out for a connector that
+  # does get switched to is the real failure mode this avoids.
+  local jvm_opts_files jvm_opts_env_block="" all_jvm_opts="" f one_opts
+  jvm_opts_files=$(tar -tzf "$EDB_HOP_ARCHIVE" 2>/dev/null | grep -E '^edb-hop/sources/[^/]+/jvm-opts$' || true)
+  if [ -n "$jvm_opts_files" ]; then
+    while IFS= read -r f; do
+      one_opts=$(tar -xzO -f "$EDB_HOP_ARCHIVE" "$f" 2>/dev/null | tr '\n' ' ')
+      [ -n "$one_opts" ] && all_jvm_opts="${all_jvm_opts}${all_jvm_opts:+ }${one_opts}"
+    done <<< "$jvm_opts_files"
+    if [ -n "$all_jvm_opts" ]; then
       jvm_opts_env_block="
-# JVM flags required by the active source connector (sources/${peek_active_source}/jvm-opts).
-ENV JAVA_TOOL_OPTIONS=\"${peek_jvm_opts}\"
+# JVM flags needed by any implemented source connector's driver
+# (every sources/*/jvm-opts in this archive) - not scoped to just
+# config.yaml's current active_source, since that can be switched at
+# runtime without rebuilding this image.
+ENV JAVA_TOOL_OPTIONS=\"${all_jvm_opts}\"
 "
     fi
   fi
+
+  local edb_hop_archive_name
+  edb_hop_archive_name=$(basename "$EDB_HOP_ARCHIVE")
 
   cat > "$out" <<DOCKERFILE
 # Auto-generated by edb-hop.sh --install --docker - review before use.
@@ -563,13 +676,13 @@ FROM ${base_image}
 ARG PROJECT_NAME=${project_name}
 ARG WEBAPP_ROOT=${webapp_root}
 
-# edb-hop-v1.2.tar.gz's own top-level folder is named "edb-hop/", so
+# ${edb_hop_archive_name}'s own top-level folder is named "edb-hop/", so
 # extracting it directly under .../config/projects/ lands it at
 # .../config/projects/edb-hop/ as long as PROJECT_NAME stays "edb-hop".
-COPY edb-hop-v1.2.tar.gz /tmp/edb-hop-v1.2.tar.gz
+COPY files/${edb_hop_archive_name} /tmp/${edb_hop_archive_name}
 RUN mkdir -p "\${WEBAPP_ROOT}/config/projects" && \\
-    tar xzf /tmp/edb-hop-v1.2.tar.gz -C "\${WEBAPP_ROOT}/config/projects/" && \\
-    rm /tmp/edb-hop-v1.2.tar.gz
+    tar xzf /tmp/${edb_hop_archive_name} -C "\${WEBAPP_ROOT}/config/projects/" && \\
+    rm /tmp/${edb_hop_archive_name}
 
 # Register the project so Hop can resolve it by name - a vanilla Hop
 # install only pre-registers "default"/"samples". Assumes hop-conf.sh
@@ -607,22 +720,34 @@ DOCKERFILE
 # ------------------------------------------------------------------
 
 cmd_config() {
-  local hop_home project_dir config_yaml asis_json tobe_json
+  normalize_eq_args "$@"
+  set -- "${NORMALIZED_ARGS[@]+"${NORMALIZED_ARGS[@]}"}"
+
+  # --project must be resolved before project_dir below is computed from
+  # it - peek for it up front (same pattern as the --docker peek in
+  # cmd_install/cmd_run), then still let the main loop below consume it
+  # too so it isn't treated as an "Unknown --config option".
+  local a prev=""
+  for a in "$@"; do
+    [ "$prev" = "--project" ] && PROJECT_NAME="$a"
+    prev="$a"
+  done
+
+  local hop_home project_dir config_yaml asis_json tobe_json proj_flag=""
+  [ "$PROJECT_NAME" != "edb-hop" ] && proj_flag=" --project $PROJECT_NAME"
   hop_home=$(resolve_hop_home)
   project_dir="$hop_home/config/projects/$PROJECT_NAME"
   config_yaml="$project_dir/config.yaml"
   asis_json="$project_dir/metadata/rdbms/ASIS.json"
   tobe_json="$project_dir/metadata/rdbms/TOBE.json"
   for f in "$config_yaml" "$asis_json" "$tobe_json"; do
-    [ -f "$f" ] || { echo "ERROR: $f not found - run './edb-hop.sh --install' first." >&2; exit 1; }
+    [ -f "$f" ] || { echo "ERROR: $f not found - run './edb-hop.sh --install${proj_flag}' first." >&2; exit 1; }
   done
 
   local asis_host="" asis_port="" asis_database="" asis_user="" asis_password="" asis_schema=""
   local tobe_host="" tobe_port="" tobe_database="" tobe_user="" tobe_password="" tobe_schema=""
   local edbldr_path="" show=0 interactive=0
 
-  normalize_eq_args "$@"
-  set -- "${NORMALIZED_ARGS[@]+"${NORMALIZED_ARGS[@]}"}"
   while [ $# -gt 0 ]; do
     case "$1" in
       --asis-host) asis_host="$2"; shift 2 ;;
@@ -638,12 +763,13 @@ cmd_config() {
       --tobe-password) tobe_password="$2"; shift 2 ;;
       --tobe-schema) tobe_schema="$2"; shift 2 ;;
       --edbldr-path) edbldr_path="$2"; shift 2 ;;
+      --project) shift 2 ;;  # already applied to PROJECT_NAME above
       --show) show=1; shift ;;
       -i|--interactive) interactive=1; shift ;;
       -h|--help)
         cat <<'EOF'
-Usage: edb-hop.sh --config [options]
-       edb-hop.sh --config -i
+Usage: edb-hop.sh --config [options] [--project NAME]
+       edb-hop.sh --config -i [--project NAME]
 
 Source connection - AS/400 / DB2 for i (writes ASIS.json + config.yaml):
   --asis-host HOST         --asis-port PORT        --asis-database NAME
@@ -659,6 +785,10 @@ Other:
   -i, --interactive        Prompt for every field one at a time instead
                             of taking them as flags. Shows the current
                             value for each; press Enter to keep it.
+  --project NAME           Configure the Hop project named NAME (see
+                            'edb-hop.sh --install --help') instead of
+                            the default "edb-hop" - must already exist
+                            (--install --project NAME first).
 
 Only the fields you actually set (via flags, or by typing something at
 a prompt in -i mode) are changed - everything else in
@@ -671,6 +801,7 @@ EOF
   done
 
   if [ "$show" -eq 1 ]; then
+    echo "== Project: $PROJECT_NAME =="
     echo "== ASIS (source) =="
     grep -E '"(hostname|port|databaseName|username|password)":' "$asis_json" | sed -E 's/"password": "[^"]*"/"password": "***"/'
     echo "== TOBE (target) =="
@@ -754,7 +885,7 @@ EOF
     sed -i "s|^\(\s*\)edbldr_path:.*|\1edbldr_path: ${esc}|" "$config_yaml"
   fi
 
-  echo "Configuration updated. Check with: ./edb-hop.sh --config --show"
+  echo "Configuration updated for project '$PROJECT_NAME'. Check with: ./edb-hop.sh --config --show${proj_flag}"
 }
 
 # ------------------------------------------------------------------
@@ -765,12 +896,17 @@ cmd_run() {
   normalize_eq_args "$@"
   set -- "${NORMALIZED_ARGS[@]+"${NORMALIZED_ARGS[@]}"}"
 
-  local a
+  local a prev=""
   for a in "$@"; do
     if [ "$a" = "--docker" ]; then
       cmd_run_docker "$@"
       return
     fi
+    # --project must be resolved before project_dir below is computed
+    # from it - peeked here (rather than in the option loop further
+    # down) for the same reason as cmd_config's identical peek.
+    [ "$prev" = "--project" ] && PROJECT_NAME="$a"
+    prev="$a"
   done
 
   local hop_home java_home project_dir
@@ -786,18 +922,40 @@ cmd_run() {
   source_jvm_opts=$(read_source_jvm_opts "$project_dir")
   export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:-}${source_jvm_opts:+ $source_jvm_opts}"
 
+  # hop-run.sh bakes a fixed "-Xmx2048m" into itself by default and does
+  # not size itself based on what's being migrated - HOP_OPTIONS, set
+  # before invoking it, is Hop's own documented way to override that.
+  # Appended after any HOP_OPTIONS already in the environment (same
+  # pattern as JAVA_TOOL_OPTIONS above) - if that also sets -Xmx, the
+  # later one on the command line wins, so config.yaml's value takes
+  # precedence over whatever was externally set, not the other way round.
+  local hop_heap_size
+  hop_heap_size=$(read_hop_heap_size "$project_dir/config.yaml")
+  export HOP_OPTIONS="${HOP_OPTIONS:-}${hop_heap_size:+ -Xmx${hop_heap_size}}"
+
   local level="Basic"
   local reset=0
+  local preflight=0
+  local preflight_limit=5
+  local compare=0
+  local compare_output=""
   local extra_params=()
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --level) level="$2"; shift 2 ;;
       --reset) reset=1; shift ;;
+      --preflight) preflight=1; shift ;;
+      --preflight-limit) preflight_limit="$2"; shift 2 ;;
+      --compare) compare=1; shift ;;
+      --compare-output) compare_output="$2"; shift 2 ;;
       --param) extra_params+=("$2"); shift 2 ;;
+      --project) shift 2 ;;  # already applied to PROJECT_NAME above
       -h|--help)
         cat <<'EOF'
 Usage: edb-hop.sh --run [--level LEVEL] [--reset] [--param KEY=VALUE]...
+                   [--preflight [--preflight-limit N]] [--project NAME]
+                   [--compare [--compare-output PATH]]
 
   --level LEVEL     Hop log level: NOTHING, ERROR, MINIMAL, BASIC,
                      DETAILED, DEBUG, ROWLEVEL. Default: Basic
@@ -805,6 +963,71 @@ Usage: edb-hop.sh --run [--level LEVEL] [--reset] [--param KEY=VALUE]...
                      (passes RESET_STATUS=true)
   --param K=V       Extra -p parameter passed through to hop-run.sh,
                      repeatable
+  --preflight       Smoke-test every selected table (DDL generation,
+                     type mapping, edbldr load path) without moving its
+                     full data: every table's extraction query gets
+                     "FETCH FIRST N ROWS ONLY" appended (N from
+                     --preflight-limit, default 5) - default query or a
+                     table_select_query override, either way. Never
+                     touches the checkpoint db (not checked against it,
+                     not recorded to it - see migrate_table.hpl's
+                     recordLoadStatus), so a later real run still
+                     processes every table in full; a preflight run
+                     leaves each target table containing only those N
+                     rows until that real run truncates and reloads it.
+                     Detected partitions are still the real ones (from
+                     catalog stats, not the capped row set), so
+                     partitioned tables get a real structural check too.
+                     A table already checkpointed SUCCESS from a
+                     previous real run is skipped, same as a normal
+                     resumed run - "Generate table DDL" truncates a
+                     table before every load regardless of --preflight,
+                     so re-preflighting an already-migrated table would
+                     otherwise cut its real data down to just N rows
+                     with no way back (edbldr loads over its own
+                     subprocess, never inside a JDBC transaction this
+                     pipeline could roll back to undo that). Preflight
+                     before any real run, when nothing's checkpointed
+                     yet, to stay clear of that entirely.
+  --preflight-limit N   Rows per table for --preflight. Default: 5.
+                     Ignored without --preflight.
+  --compare         Skip the migration entirely and instead compare row
+                     counts, column counts, and (unless
+                     migration.compare_numeric_aggregates is set to
+                     false) SUM/MIN/MAX of every numeric column, table
+                     by table, between ASIS and TOBE (respecting
+                     table_select/table_exclude the same way a real run
+                     does) - verification after a migration has already
+                     run, not part of it. Runs
+                     sources/<active_source>/compare.hpl via compare.hwf
+                     instead of migration.hwf; never touches the
+                     checkpoint db or any table's data/DDL. A table
+                     missing entirely from TOBE (never migrated, or
+                     failed) is reported as TOBE_MISSING rather than
+                     erroring the whole run. Writes a CSV report (see
+                     --compare-output) and logs a one-line summary per
+                     table plus a final count of matches/mismatches/
+                     errors.
+  --compare-output PATH   Where to write the compare report. Default:
+                     config.yaml's migration.compare_output, or
+                     "${PROJECT_HOME}/reports/compare_<timestamp>.csv"
+                     if that's not set either. ${PROJECT_HOME} and
+                     ${TIMESTAMP} are substituted in either source.
+                     Ignored without --compare.
+  --project NAME    Run the Hop project named NAME (see
+                     'edb-hop.sh --install --help') instead of the
+                     default "edb-hop" - must already exist and be
+                     configured (--install/--config --project NAME
+                     first). Independent checkpoint db and
+                     edbldr_work/, so this can run at the same time as
+                     the default project (or another --project) against
+                     the same Hop/Java install.
+
+The JVM's max heap size (Xmx) for this run is config.yaml's
+general.hop_heap_size (default 2g, matching hop-run.sh's own built-in
+default) - not a flag here, since it's a resource limit tied to the
+deployment's own memory budget rather than something you'd want to
+change per invocation. Edit config.yaml to change it.
 
 See 'edb-hop.sh --run --docker --help' to run a Docker-image build instead.
 EOF
@@ -813,8 +1036,25 @@ EOF
     esac
   done
 
+  if [ "$preflight" -eq 1 ] && ! [[ "$preflight_limit" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: --preflight-limit must be a positive integer, got '$preflight_limit'." >&2
+    exit 1
+  fi
+
+  if [ "$compare" -eq 1 ] && [ "$preflight" -eq 1 ]; then
+    echo "ERROR: --compare and --preflight are mutually exclusive (--compare skips the migration entirely)." >&2
+    exit 1
+  fi
+
   local params=()
   [ "$reset" -eq 1 ] && params+=("RESET_STATUS=true")
+  if [ "$preflight" -eq 1 ]; then
+    params+=("PREFLIGHT=true" "PREFLIGHT_LIMIT=${preflight_limit}")
+    echo "== Preflight mode: capping every table at ${preflight_limit} rows, checkpoint untouched =="
+  fi
+  if [ "$compare" -eq 1 ] && [ -n "$compare_output" ]; then
+    params+=("COMPARE_OUTPUT=${compare_output}")
+  fi
   params+=("${extra_params[@]+"${extra_params[@]}"}")
 
   local p_arg=()
@@ -824,8 +1064,14 @@ EOF
     p_arg=(-p "$joined")
   fi
 
+  local workflow_file="migration.hwf"
+  if [ "$compare" -eq 1 ]; then
+    workflow_file="compare.hwf"
+    echo "== Compare mode: checking ASIS vs TOBE row/column counts, no data or DDL touched =="
+  fi
+
   cd "$hop_home"
-  ./hop-run.sh --project="$PROJECT_NAME" --file=migration.hwf --level="$level" "${p_arg[@]+"${p_arg[@]}"}"
+  ./hop-run.sh --project="$PROJECT_NAME" --file="$workflow_file" --level="$level" "${p_arg[@]+"${p_arg[@]}"}"
 }
 
 # ------------------------------------------------------------------
