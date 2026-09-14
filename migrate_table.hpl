@@ -97,8 +97,20 @@ private boolean preflight;
 private String tgtConnName;
 private java.util.List identityColumns;
 private int nulBytesStrippedCount;
-private boolean edbldrStripEmbeddedNewlines;
-private int newlinesStrippedCount;
+
+// A record boundary that can't collide with real row content the way a
+// bare '\n' can - see startEdbldrProcess()'s RECORDS DELIMITED BY and
+// formatRowAsCsv's use of this same value as the row terminator written
+// to edbldr's stdin. 0x1E is ASCII's own "Record Separator" control
+// character, reserved for exactly this purpose since long before CSV
+// existed and essentially never present in real text/business data
+// (unlike e.g. a printable multi-char sequence, which could in theory
+// collide) - confirmed against the real edbldr binary that this lets a
+// value with a genuine embedded newline load correctly, unmodified,
+// instead of failing with "unterminated CSV quoted field" (edbldr's
+// CSV reader does not handle a quoted field spanning physical lines
+// when the record boundary is the default bare newline).
+private static final String RECORD_DELIMITER = "\u001E";
 
 // Rows are batched into this buffer and flushed to edbldr's stdin every
 // rowBatchSize rows, instead of one write() call per row - measured
@@ -137,7 +149,6 @@ public boolean processRow() throws HopException
     rowBatch = new StringBuffer();
     rowBatchCount = 0;
     nulBytesStrippedCount = 0;
-    newlinesStrippedCount = 0;
     resumeFromCheckpoint = Boolean.parseBoolean(getVariable("RESUME_FROM_CHECKPOINT", "false"));
     statusDbPath = getVariable("STATUS_DB_PATH");
     preflight = Boolean.parseBoolean(getVariable("PREFLIGHT", "false"));
@@ -263,8 +274,6 @@ public boolean processRow() throws HopException
     edbldrHandleConflicts = Boolean.parseBoolean(String.valueOf(tobeCfg.get("edbldr_handle_conflicts")));
     edbldrEmptyCsvField = tobeCfg.get("edbldr_empty_csv_field") == null
       ? "" : String.valueOf(tobeCfg.get("edbldr_empty_csv_field")).trim();
-    edbldrStripEmbeddedNewlines = tobeCfg.get("edbldr_strip_embedded_newlines") == null
-      ? true : Boolean.parseBoolean(String.valueOf(tobeCfg.get("edbldr_strip_embedded_newlines")));
 
     // USERID goes into a parameter file with owner-only permissions
     // instead of on the command line, so it is not visible via ps/
@@ -298,6 +307,14 @@ public boolean processRow() throws HopException
     // option is supported with PARALLEL load").
     ctl.append("APPEND INTO TABLE ").append(qq(tgtSchema, targetTable)).append("\n");
     ctl.append("FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"'\n");
+    // Row separator between records - not a bare newline (edbldr's CSV
+    // reader treats a physical line as a record regardless of quoting,
+    // so a value with a genuine embedded newline would otherwise fail
+    // "unterminated CSV quoted field" even though the CSV itself is
+    // correctly quoted/escaped). formatRowAsCsv's flushRowBatch below
+    // writes this exact same RECORD_DELIMITER after every row instead
+    // of '\n', so an embedded newline just stays part of the value.
+    ctl.append("RECORDS DELIMITED BY '").append(RECORD_DELIMITER).append("'\n");
     ctl.append("TRAILING NULLCOLS\n");
     ctl.append("(\n");
     String columnListCsv = "";
@@ -352,7 +369,7 @@ public boolean processRow() throws HopException
   }
 
   String line = formatRowAsCsv(rowMetaRef, r);
-  rowBatch.append(line).append('\n');
+  rowBatch.append(line).append(RECORD_DELIMITER);
   rowBatchCount++;
   if (rowBatchCount &gt;= rowBatchSize) {
     flushRowBatch();
@@ -541,9 +558,6 @@ private boolean finishAndVerify() {
     if (nulBytesStrippedCount &gt; 0) {
       logBasic("Stripped NUL byte(s) (0x00) from " + nulBytesStrippedCount + " cell(s) in " + targetTable + " before loading - Postgres/EPAS cannot store them in text columns; likely legacy padding/binary leftovers in a source CHAR/VARCHAR column not flagged as FOR BIT DATA.");
     }
-    if (newlinesStrippedCount &gt; 0) {
-      logBasic("Replaced embedded newline(s)/carriage return(s) with a space in " + newlinesStrippedCount + " cell(s) in " + targetTable + " before loading - edbldr_strip_embedded_newlines is on (see config.yaml); set it to false to let those rows fail into .bad instead of flattening their line breaks.");
-    }
     resyncIdentitySequences();
     return true;
   }
@@ -638,14 +652,15 @@ private String formatRowAsCsv(org.apache.hop.core.row.IRowMeta rowMeta, Object[]
       nulBytesStrippedCount++;
     }
 
-    // See edbldr_strip_embedded_newlines in config.yaml - unlike the
-    // NUL-byte case above, a newline is real, storable data; this is a
-    // load-reliability trade-off (edbldr's CSV reader has been observed
-    // failing on a legitimately quoted multi-line field), not a strict
-    // correctness fix, so it is toggleable and defaults on.
-    if (edbldrStripEmbeddedNewlines &amp;&amp; cell != null &amp;&amp; (cell.indexOf('\n') &gt;= 0 || cell.indexOf('\r') &gt;= 0)) {
-      cell = cell.replace('\n', ' ').replace('\r', ' ');
-      newlinesStrippedCount++;
+    // A stray occurrence of RECORD_DELIMITER itself inside real data
+    // would be misread as a row boundary mid-value, corrupting that row
+    // and (via a field-count mismatch) usually the next one too. 0x1E
+    // is a control character with no legitimate use in real text, so
+    // this should never fire - present purely as the same kind of
+    // defense-in-depth as the NUL-byte handling above, not because it
+    // is expected to trigger.
+    if (cell != null &amp;&amp; cell.indexOf(RECORD_DELIMITER) &gt;= 0) {
+      cell = cell.replace(RECORD_DELIMITER, "");
     }
 
     boolean isRealValue = (v != null);
