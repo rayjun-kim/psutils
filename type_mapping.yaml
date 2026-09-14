@@ -53,13 +53,17 @@ mapping:
   GRAPHIC_FOR_BIT_DATA: BYTEA
   VARGRAPHIC_FOR_BIT_DATA: BYTEA
 
-  # Mixed/non-single-byte CCSID variants of the character types above
-  # (e.g. Korean 933, Traditional Chinese 937, UTF-16BE 1200, UTF-8
-  # 1208, UCS-2 13488 - see isKnownSingleByteCcsid in migrate_table.hpl)
-  # - DB2's byte-based LENGTH doesn't reliably cap the character count
-  # for these, so they're mapped to unbounded TEXT instead of a fixed
+  # Mixed SBCS+DBCS CCSID variants of the character types above (Korean
+  # 933, Traditional Chinese 937 - see isKnownMixedCcsid in
+  # migrate_table.hpl) - DB2's byte-based LENGTH doesn't reliably cap
+  # the character count for these (shift-coded, variable bytes per
+  # character), so they're mapped to unbounded TEXT instead of a fixed
   # CHAR(n)/VARCHAR(n) to avoid a "value too long" failure at load time
-  # on otherwise perfectly valid text.
+  # on otherwise perfectly valid text - confirmed against a real CCSID
+  # 933 column. Deliberately narrow: only a CCSID confirmed to have this
+  # mismatch is here: an unfamiliar CCSID keeps the exact-length
+  # mapping rather than widening every character column to TEXT on
+  # caution alone.
   CHARACTER_MIXED_CCSID: TEXT
   CHAR_MIXED_CCSID: TEXT
   VARCHAR_MIXED_CCSID: TEXT
